@@ -27,12 +27,18 @@ pub type InitialInput = ();
 #[derive(Clone, Debug)]
 pub struct Scan {
     pub collection_and_segments: CollectionAndSegments,
+    pub shard_index: u32,
+    pub num_shards: u32,
+    /// Upper bound log offset scouted by the frontend.
+    /// 0 means the worker should scout independently.
+    pub log_upper_bound_offset: i64,
 }
 
 impl TryFrom<chroma_proto::ScanOperator> for Scan {
     type Error = QueryConversionError;
 
     fn try_from(value: chroma_proto::ScanOperator) -> Result<Self, Self::Error> {
+        let num_shards = value.num_shards.max(1);
         Ok(Self {
             collection_and_segments: CollectionAndSegments {
                 collection: value
@@ -52,6 +58,9 @@ impl TryFrom<chroma_proto::ScanOperator> for Scan {
                     .ok_or(QueryConversionError::field("vector segment"))?
                     .try_into()?,
             },
+            shard_index: value.shard_index,
+            num_shards,
+            log_upper_bound_offset: value.log_upper_bound_offset,
         })
     }
 }
@@ -71,6 +80,9 @@ impl TryFrom<Scan> for chroma_proto::ScanOperator {
             knn: Some(value.collection_and_segments.vector_segment.into()),
             metadata: Some(value.collection_and_segments.metadata_segment.into()),
             record: Some(value.collection_and_segments.record_segment.into()),
+            shard_index: value.shard_index,
+            num_shards: value.num_shards,
+            log_upper_bound_offset: value.log_upper_bound_offset,
         })
     }
 }
@@ -2359,6 +2371,40 @@ pub struct GroupBy {
     /// Aggregation to apply within each group (required when keys is non-empty)
     #[serde(default)]
     pub aggregate: Option<Aggregate>,
+}
+
+impl GroupBy {
+    /// Returns true when this GroupBy has both keys and an aggregate,
+    /// meaning it will actually perform grouping.
+    pub fn is_active(&self) -> bool {
+        !self.keys.is_empty() && self.aggregate.is_some()
+    }
+
+    /// Returns the sort keys from the aggregate (`MinK`/`MaxK`),
+    /// or an empty slice if no aggregate is set.
+    pub fn aggregate_keys(&self) -> &[Key] {
+        match &self.aggregate {
+            Some(Aggregate::MinK { keys, .. } | Aggregate::MaxK { keys, .. }) => keys,
+            None => &[],
+        }
+    }
+
+    /// Returns all distinct metadata `Key`s referenced by this GroupBy
+    /// (from both grouping keys and aggregate sort keys).
+    pub fn metadata_keys(&self) -> Vec<Key> {
+        let mut result: Vec<Key> = self
+            .keys
+            .iter()
+            .filter(|k| matches!(k, Key::MetadataField(_)))
+            .cloned()
+            .collect();
+        for k in self.aggregate_keys() {
+            if matches!(k, Key::MetadataField(_)) && !result.contains(k) {
+                result.push(k.clone());
+            }
+        }
+        result
+    }
 }
 
 impl TryFrom<chroma_proto::Aggregate> for Aggregate {

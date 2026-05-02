@@ -127,6 +127,8 @@ pub enum BatchGetCollectionVersionFilePathsError {
     Grpc(#[from] Status),
     #[error("Could not parse UUID from string {1}: {0}")]
     Uuid(uuid::Error, String),
+    #[error("Client resolution error: {0}")]
+    ClientResolution(#[from] ClientResolutionError),
 }
 
 impl ChromaError for BatchGetCollectionVersionFilePathsError {
@@ -134,6 +136,7 @@ impl ChromaError for BatchGetCollectionVersionFilePathsError {
         match self {
             BatchGetCollectionVersionFilePathsError::Grpc(status) => status.code().into(),
             BatchGetCollectionVersionFilePathsError::Uuid(_, _) => ErrorCodes::InvalidArgument,
+            BatchGetCollectionVersionFilePathsError::ClientResolution(e) => e.code(),
         }
     }
 }
@@ -144,6 +147,8 @@ pub enum BatchGetCollectionSoftDeleteStatusError {
     Grpc(#[from] Status),
     #[error("Could not parse UUID from string {1}: {0}")]
     Uuid(uuid::Error, String),
+    #[error("Client resolution error: {0}")]
+    ClientResolution(#[from] ClientResolutionError),
 }
 
 impl ChromaError for BatchGetCollectionSoftDeleteStatusError {
@@ -151,6 +156,7 @@ impl ChromaError for BatchGetCollectionSoftDeleteStatusError {
         match self {
             BatchGetCollectionSoftDeleteStatusError::Grpc(status) => status.code().into(),
             BatchGetCollectionSoftDeleteStatusError::Uuid(_, _) => ErrorCodes::InvalidArgument,
+            BatchGetCollectionSoftDeleteStatusError::ClientResolution(e) => e.code(),
         }
     }
 }
@@ -908,6 +914,56 @@ impl ChromaError for GetCollectionByCrnError {
     }
 }
 
+#[non_exhaustive]
+#[derive(Clone, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct GetCollectionByIdRequest {
+    pub collection_id: CollectionUuid,
+    pub tenant_id: String,
+    pub database_name: DatabaseName,
+}
+
+impl GetCollectionByIdRequest {
+    pub fn try_new(
+        collection_id: String,
+        tenant_id: String,
+        database_name: DatabaseName,
+    ) -> Result<Self, ChromaValidationError> {
+        let collection_id: CollectionUuid = collection_id.parse().map_err(|_| {
+            let mut err = ValidationError::new("invalid_collection_id");
+            err.message = Some("Invalid collection ID format, expected UUID".into());
+            ChromaValidationError::from(("collection_id", err))
+        })?;
+        Ok(Self {
+            collection_id,
+            tenant_id,
+            database_name,
+        })
+    }
+}
+
+pub type GetCollectionByIdResponse = Collection;
+
+#[derive(Debug, Error)]
+pub enum GetCollectionByIdError {
+    #[error("Failed to reconcile schema: {0}")]
+    InvalidSchema(#[from] SchemaError),
+    #[error(transparent)]
+    Internal(#[from] Box<dyn ChromaError>),
+    #[error("Collection [{0}] does not exist")]
+    NotFound(CollectionUuid),
+}
+
+impl ChromaError for GetCollectionByIdError {
+    fn code(&self) -> ErrorCodes {
+        match self {
+            GetCollectionByIdError::InvalidSchema(e) => e.code(),
+            GetCollectionByIdError::Internal(err) => err.code(),
+            GetCollectionByIdError::NotFound(_) => ErrorCodes::NotFound,
+        }
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize, Debug)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub enum CollectionMetadataUpdate {
@@ -1323,6 +1379,24 @@ fn validate_embeddings(embeddings: &[Vec<f32>]) -> Result<(), ValidationError> {
         return Err(ValidationError::new("embedding_minimum_dimensions")
             .with_message("Each embedding must have at least 1 dimension".into()));
     }
+    if embeddings.iter().any(|e| e.iter().any(|&v| !v.is_finite())) {
+        return Err(ValidationError::new("embedding_non_finite")
+            .with_message("Embeddings must not contain NaN or Infinity values".into()));
+    }
+    Ok(())
+}
+
+fn validate_update_embeddings(embeddings: &[Option<Vec<f32>>]) -> Result<(), ValidationError> {
+    for e in embeddings.iter().flatten() {
+        if e.is_empty() {
+            return Err(ValidationError::new("embedding_minimum_dimensions")
+                .with_message("Each embedding must have at least 1 dimension".into()));
+        }
+        if e.iter().any(|&v| !v.is_finite()) {
+            return Err(ValidationError::new("embedding_non_finite")
+                .with_message("Embeddings must not contain NaN or Infinity values".into()));
+        }
+    }
     Ok(())
 }
 
@@ -1379,6 +1453,7 @@ pub struct UpdateCollectionRecordsRequest {
     pub database_name: String,
     pub collection_id: CollectionUuid,
     pub ids: Vec<String>,
+    #[validate(custom(function = "validate_update_embeddings"))]
     pub embeddings: Option<Vec<Option<Vec<f32>>>>,
     pub documents: Option<Vec<Option<String>>>,
     pub uris: Option<Vec<Option<String>>>,
@@ -2745,6 +2820,66 @@ mod test {
         );
 
         // Should fail because sparse vector is not sorted
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_request_rejects_nan_embedding() {
+        let result = AddCollectionRecordsRequest::try_new(
+            "tenant".to_string(),
+            "database".to_string(),
+            CollectionUuid(uuid::Uuid::new_v4()),
+            vec!["id1".to_string()],
+            vec![vec![1.0, f32::NAN, 3.0]],
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_request_rejects_infinity_embedding() {
+        let result = AddCollectionRecordsRequest::try_new(
+            "tenant".to_string(),
+            "database".to_string(),
+            CollectionUuid(uuid::Uuid::new_v4()),
+            vec!["id1".to_string()],
+            vec![vec![1.0, f32::INFINITY]],
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_request_rejects_nan_embedding() {
+        let result = UpdateCollectionRecordsRequest::try_new(
+            "tenant".to_string(),
+            "database".to_string(),
+            CollectionUuid(uuid::Uuid::new_v4()),
+            vec!["id1".to_string()],
+            Some(vec![Some(vec![1.0, f32::NAN])]),
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_upsert_request_rejects_nan_embedding() {
+        let result = UpsertCollectionRecordsRequest::try_new(
+            "tenant".to_string(),
+            "database".to_string(),
+            CollectionUuid(uuid::Uuid::new_v4()),
+            vec!["id1".to_string()],
+            vec![vec![f32::NEG_INFINITY, 2.0]],
+            None,
+            None,
+            None,
+        );
         assert!(result.is_err());
     }
 }

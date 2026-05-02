@@ -29,7 +29,7 @@ use chroma_blockstore::RootManager;
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_log::Log;
 use chroma_storage::Storage;
-use chroma_sysdb::{GetCollectionsOptions, SysDb};
+use chroma_sysdb::{DatabaseOrTopology, GetCollectionsOptions, SysDb};
 use chroma_system::{
     wrap, ChannelError, ComponentContext, ComponentHandle, Dispatcher, Handler,
     OneshotMessageReceiver, Orchestrator, OrchestratorContext, PanicError, System, TaskError,
@@ -49,6 +49,8 @@ use tokio::sync::oneshot::{error::RecvError, Sender};
 use tracing::Span;
 use wal3::LogPosition;
 
+use crate::mcmr::RegionsAndTopologies;
+
 #[derive(Debug)]
 pub struct GarbageCollectorOrchestrator {
     collection_id: CollectionUuid,
@@ -61,6 +63,7 @@ pub struct GarbageCollectorOrchestrator {
     system: System,
     storage: Storage,
     logs: Log,
+    regions_and_topologies: Option<Arc<RegionsAndTopologies>>,
     root_manager: RootManager,
     result_channel: Option<Sender<Result<GarbageCollectorResponse, GarbageCollectorError>>>,
     cleanup_mode: CleanupMode,
@@ -76,7 +79,7 @@ pub struct GarbageCollectorOrchestrator {
     graph: Option<VersionGraph>,
     soft_deleted_collections_to_gc: HashSet<CollectionUuid>,
     tenant: Option<String>,
-    database_name: Option<String>,
+    database_name: DatabaseName,
 
     num_files_deleted: u32,
     num_versions_deleted: u32,
@@ -88,6 +91,7 @@ pub struct GarbageCollectorOrchestrator {
 impl GarbageCollectorOrchestrator {
     pub fn new(
         collection_id: CollectionUuid,
+        database_name: DatabaseName,
         version_file_path: String,
         lineage_file_path: Option<String>,
         version_absolute_cutoff_time: DateTime<Utc>,
@@ -97,6 +101,7 @@ impl GarbageCollectorOrchestrator {
         system: System,
         storage: Storage,
         logs: Log,
+        regions_and_topologies: Option<Arc<RegionsAndTopologies>>,
         root_manager: RootManager,
         cleanup_mode: CleanupMode,
         min_versions_to_keep: u32,
@@ -115,6 +120,7 @@ impl GarbageCollectorOrchestrator {
             system,
             storage,
             logs,
+            regions_and_topologies,
             root_manager,
             cleanup_mode,
             result_channel: None,
@@ -129,7 +135,7 @@ impl GarbageCollectorOrchestrator {
             graph: None,
             soft_deleted_collections_to_gc: HashSet::new(),
             tenant: None,
-            database_name: None,
+            database_name,
 
             num_files_deleted: 0,
             num_versions_deleted: 0,
@@ -199,6 +205,47 @@ where
     }
 }
 
+fn build_versions_to_mark(
+    versions_by_collection: &HashMap<CollectionUuid, HashMap<i64, CollectionVersionAction>>,
+    version_files: &HashMap<CollectionUuid, Arc<CollectionVersionFile>>,
+) -> Result<Vec<VersionListForCollection>, GarbageCollectorError> {
+    versions_by_collection
+        .iter()
+        .filter_map(|(collection_id, versions)| {
+            let versions = versions
+                .iter()
+                .filter_map(|(version, action)| {
+                    (*action == CollectionVersionAction::Delete).then_some(*version)
+                })
+                .collect::<Vec<_>>();
+
+            if versions.is_empty() {
+                return None;
+            }
+
+            // NOTE(rescrv):  Closure looks odd.  Saves the question mark operator to work.
+            Some((|| {
+                let version_file = version_files
+                    .get(collection_id)
+                    .ok_or(GarbageCollectorError::MissingVersionFile(*collection_id))?;
+
+                let collection_info = version_file.collection_info_immutable.as_ref().ok_or(
+                    GarbageCollectorError::InvariantViolation(
+                        "Expected collection_info_immutable to be set".to_string(),
+                    ),
+                )?;
+
+                Ok::<_, GarbageCollectorError>(VersionListForCollection {
+                    collection_id: collection_id.to_string(),
+                    versions,
+                    tenant_id: collection_info.tenant_id.clone(),
+                    database_id: collection_info.database_id.clone(),
+                })
+            })())
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct ConstructVersionGraphRequest;
 
@@ -243,15 +290,26 @@ impl GarbageCollectorOrchestrator {
     ) -> Result<HashSet<CollectionUuid>, GarbageCollectorError> {
         let soft_delete_statuses = self
             .sysdb_client
-            .batch_get_collection_soft_delete_status(all_collection_ids.clone())
+            .batch_get_collection_soft_delete_status(
+                Some(self.database_name.clone()),
+                all_collection_ids.clone(),
+            )
             .await
             .map_err(|e| GarbageCollectorError::SysDbMethodFailed(e.to_string()))?;
 
         let all_collection_ids: HashSet<CollectionUuid> = all_collection_ids.into_iter().collect();
 
+        tracing::trace!("Soft delete statuses: {:?}", soft_delete_statuses);
+
         let soft_deleted_collections_to_gc = soft_delete_statuses
             .iter()
             .filter_map(|(collection_id, status)| {
+                tracing::trace!(
+                    collection_id = %collection_id,
+                    is_soft_deleted = status,
+                    in_all_collection_ids = all_collection_ids.contains(collection_id),
+                    "Collection soft delete status"
+                );
                 if *status && all_collection_ids.contains(collection_id) {
                     Some(*collection_id)
                 } else {
@@ -264,6 +322,9 @@ impl GarbageCollectorOrchestrator {
             .sysdb_client
             .get_collections(GetCollectionsOptions {
                 collection_ids: Some(soft_deleted_collections_to_gc),
+                database_or_topology: Some(DatabaseOrTopology::Database(
+                    self.database_name.clone(),
+                )),
                 include_soft_deleted: true,
                 ..Default::default()
             })
@@ -273,6 +334,12 @@ impl GarbageCollectorOrchestrator {
         let mut eligible_ids = HashSet::new();
         let cutoff_time: SystemTime = self.collection_soft_delete_absolute_cutoff_time.into();
         for collection in collections {
+            tracing::debug!(
+                "Collection {} was updated at {:?}, cutoff time is {:?}",
+                collection.collection_id,
+                collection.updated_at,
+                cutoff_time
+            );
             if collection.updated_at < cutoff_time {
                 eligible_ids.insert(collection.collection_id);
             } else {
@@ -297,6 +364,7 @@ impl GarbageCollectorOrchestrator {
             self.collection_id,
             self.version_file_path.clone(),
             self.lineage_file_path.clone(),
+            self.database_name.clone(),
         );
         let output = orchestrator.run(self.system.clone()).await?;
 
@@ -314,33 +382,6 @@ impl GarbageCollectorOrchestrator {
         self.version_files = output.version_files;
         self.graph = Some(output.graph.clone());
 
-        let collection_ids = self.version_files.keys().cloned().collect::<Vec<_>>();
-        let collections = self
-            .sysdb_client
-            .get_collections(GetCollectionsOptions {
-                collection_ids: Some(collection_ids),
-                include_soft_deleted: true,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| GarbageCollectorError::SysDbMethodFailed(e.to_string()))?;
-
-        let mut database_names = HashMap::new();
-        for collection in collections {
-            match DatabaseName::new(collection.database.clone()) {
-                Some(database_name) => {
-                    database_names.insert(collection.collection_id, database_name);
-                }
-                None => {
-                    tracing::error!(
-                        "Collection {} has invalid database name '{}', skipping GC",
-                        collection.collection_id,
-                        collection.database
-                    );
-                }
-            }
-        }
-
         let task = wrap(
             Box::new(ComputeVersionsToDeleteOperator {}),
             ComputeVersionsToDeleteInput {
@@ -348,7 +389,6 @@ impl GarbageCollectorOrchestrator {
                 soft_deleted_collections: self.soft_deleted_collections_to_gc.clone(),
                 cutoff_time: self.version_absolute_cutoff_time,
                 min_versions_to_keep: self.min_versions_to_keep,
-                database_names,
             },
             ctx.receiver(),
             self.context.task_cancellation_token.clone(),
@@ -381,45 +421,18 @@ impl GarbageCollectorOrchestrator {
         self.versions_to_delete_output = Some(output.clone());
 
         // First, mark versions as deleted in sysdb
-        let versions_to_mark = output
-            .versions
-            .iter()
-            .map(|(collection_id, (_database_name, versions))| {
-                let version_file = self
-                    .version_files
-                    .get(collection_id)
-                    .ok_or(GarbageCollectorError::MissingVersionFile(*collection_id))?;
+        let versions_to_mark = build_versions_to_mark(&output.versions, &self.version_files)?;
 
-                let collection_info = version_file.collection_info_immutable.as_ref().ok_or(
-                    GarbageCollectorError::InvariantViolation(
-                        "Expected collection_info_immutable to be set".to_string(),
-                    ),
-                )?;
+        if !versions_to_mark.is_empty() {
+            self.sysdb_client
+                .mark_version_for_deletion(0, versions_to_mark, self.database_name.clone())
+                .await
+                .map_err(|err| GarbageCollectorError::SysDbMethodFailed(err.to_string()))?;
 
-                Ok::<_, GarbageCollectorError>(VersionListForCollection {
-                    collection_id: collection_id.to_string(),
-                    versions: versions
-                        .iter()
-                        .filter_map(|(version, action)| {
-                            if *action == CollectionVersionAction::Delete {
-                                Some(*version)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>(),
-                    tenant_id: collection_info.tenant_id.clone(),
-                    database_id: collection_info.database_id.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        self.sysdb_client
-            .mark_version_for_deletion(0, versions_to_mark)
-            .await
-            .map_err(|err| GarbageCollectorError::SysDbMethodFailed(err.to_string()))?;
-
-        tracing::debug!("Marked versions as deleted in SysDb.");
+            tracing::debug!("Marked versions as deleted in SysDb.");
+        } else {
+            tracing::debug!("No versions to mark for deletion in SysDb.");
+        }
 
         // Now, list files for each version
         let root_manager = self.root_manager.clone();
@@ -428,7 +441,7 @@ impl GarbageCollectorOrchestrator {
         let version_files = self.version_files.clone();
 
         let mut stream = futures::stream::iter(output.versions.into_iter().flat_map(
-            |(collection_id, (_database_name, versions))| {
+            |(collection_id, versions)| {
                 versions
                     .keys()
                     .map(|version| (collection_id, *version))
@@ -501,7 +514,7 @@ impl GarbageCollectorOrchestrator {
             ),
         )?;
 
-        for (collection_id, (database_name, versions)) in &versions_to_delete.versions {
+        for (collection_id, versions) in &versions_to_delete.versions {
             let Some(&min_version_to_keep) = versions
                 .iter()
                 .filter_map(|(version, action)| {
@@ -546,10 +559,7 @@ impl GarbageCollectorOrchestrator {
             collections_to_garbage_collect.insert(
                 *collection_id,
                 // The minimum offset to keep is one after the minimum compaction offset
-                (
-                    database_name.clone(),
-                    LogPosition::from_offset(min_compaction_log_offset) + 1u64,
-                ),
+                LogPosition::from_offset(min_compaction_log_offset) + 1u64,
             );
         }
 
@@ -559,12 +569,14 @@ impl GarbageCollectorOrchestrator {
                 mode: self.cleanup_mode,
                 storage: self.storage.clone(),
                 logs: self.logs.clone(),
+                regions_and_topologies: self.regions_and_topologies.clone(),
                 enable_dangerous_option_to_ignore_min_versions_for_wal3: self
                     .enable_dangerous_option_to_ignore_min_versions_for_wal3,
             }),
             DeleteUnusedLogsInput {
                 collections_to_destroy,
                 collections_to_garbage_collect,
+                database_name: Some(self.database_name.clone()),
             },
             ctx.receiver(),
             self.context.task_cancellation_token.clone(),
@@ -580,12 +592,6 @@ impl GarbageCollectorOrchestrator {
         &mut self,
         output: ListFilesAtVersionOutput,
     ) -> Result<(), GarbageCollectorError> {
-        let version_file = self.version_files.get(&output.collection_id).ok_or(
-            GarbageCollectorError::InvariantViolation(format!(
-                "Expected version file to be set for collection {}",
-                output.collection_id
-            )),
-        )?;
         let version_action = self
             .versions_to_delete_output
             .as_ref()
@@ -598,7 +604,6 @@ impl GarbageCollectorOrchestrator {
                 "Expected versions_to_delete_output to contain collection {}",
                 output.collection_id
             )))?
-            .1
             .get(&output.version)
             .ok_or(GarbageCollectorError::InvariantViolation(format!(
                 "Expected versions_to_delete_output to contain version {} for collection {}",
@@ -704,13 +709,18 @@ impl GarbageCollectorOrchestrator {
                 }
                 Ok(false)
             }
-            let extracted_paths = nodes_from_root_to_this_node
-                .iter()
-                .map(|node| extract_paths(version_file, node, &output).map(|x| (node.version, x)))
-                .collect::<Vec<_>>();
-            let mut have_paths = Vec::with_capacity(extracted_paths.len());
-            for res in extracted_paths.into_iter() {
-                have_paths.push(res?);
+            let mut have_paths = Vec::with_capacity(nodes_from_root_to_this_node.len());
+            for node in nodes_from_root_to_this_node.iter() {
+                let node_version_file = self.version_files.get(&node.collection_id).ok_or(
+                    GarbageCollectorError::InvariantViolation(format!(
+                        "Expected version file to be set for collection {}",
+                        node.collection_id
+                    )),
+                )?;
+                have_paths.push((
+                    node.version,
+                    extract_paths(node_version_file, node, &output)?,
+                ));
             }
             let has_no_paths_at_version = have_paths
                 .into_iter()
@@ -795,8 +805,6 @@ impl GarbageCollectorOrchestrator {
         )?;
         let tenant_id = collection_info.tenant_id.clone();
         self.tenant = Some(tenant_id.clone());
-        let database_name = collection_info.database_name.clone();
-        self.database_name = Some(database_name.clone());
 
         let task = wrap(
             Box::new(DeleteUnusedFilesOperator::new(
@@ -853,7 +861,7 @@ impl GarbageCollectorOrchestrator {
         let versions_to_delete = versions_to_delete
             .versions
             .iter()
-            .filter_map(|(collection_id, (_database_name, versions))| {
+            .filter_map(|(collection_id, versions)| {
                 let versions = versions
                     .iter()
                     .filter_map(|(version, action)| {
@@ -923,6 +931,7 @@ impl GarbageCollectorOrchestrator {
                         collection_id: collection_id.to_string(),
                         versions,
                     },
+                    database_name: self.database_name.clone(),
                 },
                 ctx.receiver(),
                 self.context.task_cancellation_token.clone(),
@@ -1003,11 +1012,7 @@ impl GarbageCollectorOrchestrator {
                             .ok_or(GarbageCollectorError::InvariantViolation(
                                 "Expected tenant to be set".to_string(),
                             ))?,
-                        self.database_name.clone().ok_or(
-                            GarbageCollectorError::InvariantViolation(
-                                "Expected database to be set".to_string(),
-                            ),
-                        )?,
+                        self.database_name.clone().into_string(),
                         collection_id,
                     )
                     .await?;
@@ -1132,18 +1137,140 @@ impl Handler<TaskResult<DeleteVersionsAtSysDbOutput, DeleteVersionsAtSysDbError>
 
 #[cfg(test)]
 mod tests {
+    use super::build_versions_to_mark;
+    use super::GarbageCollectorError;
     use super::GarbageCollectorOrchestrator;
+    use crate::operators::compute_versions_to_delete_from_graph::CollectionVersionAction;
+    use crate::operators::compute_versions_to_delete_from_graph::ComputeVersionsToDeleteOutput;
+    use crate::operators::list_files_at_version::ListFilesAtVersionOutput;
+    use crate::types::{VersionGraph, VersionGraphNode};
     use chroma_blockstore::RootManager;
     use chroma_cache::nop::NopCache;
-    use chroma_log::Log;
+    use chroma_log::{in_memory_log::InMemoryLog, Log};
     use chroma_storage::test_storage;
     use chroma_sysdb::{GetCollectionsOptions, TestSysDb};
     use chroma_system::{Dispatcher, Orchestrator, System};
     use chroma_types::{
+        chroma_proto::{
+            CollectionInfoImmutable, CollectionSegmentInfo, CollectionVersionFile,
+            CollectionVersionHistory, CollectionVersionInfo, FilePaths, FlushSegmentCompactionInfo,
+        },
         CollectionUuid, Segment, SegmentFlushInfo, SegmentScope, SegmentType, SegmentUuid,
     };
     use chrono::DateTime;
     use std::{collections::HashMap, sync::Arc, time::SystemTime};
+
+    #[test]
+    fn build_versions_to_mark_skips_empty_collections() {
+        let keep_only_collection_id = CollectionUuid::new();
+        let delete_collection_id = CollectionUuid::new();
+
+        let versions = HashMap::from([
+            (
+                keep_only_collection_id,
+                HashMap::from([(1, CollectionVersionAction::Keep)]),
+            ),
+            (
+                delete_collection_id,
+                HashMap::from([
+                    (2, CollectionVersionAction::Keep),
+                    (3, CollectionVersionAction::Delete),
+                ]),
+            ),
+        ]);
+
+        let version_files = HashMap::from([
+            (
+                keep_only_collection_id,
+                Arc::new(CollectionVersionFile {
+                    collection_info_immutable: Some(CollectionInfoImmutable {
+                        tenant_id: "tenant-a".to_string(),
+                        database_id: "db-a".to_string(),
+                        collection_id: keep_only_collection_id.to_string(),
+                        dimension: 0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            ),
+            (
+                delete_collection_id,
+                Arc::new(CollectionVersionFile {
+                    collection_info_immutable: Some(CollectionInfoImmutable {
+                        tenant_id: "tenant-b".to_string(),
+                        database_id: "db-b".to_string(),
+                        collection_id: delete_collection_id.to_string(),
+                        dimension: 0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            ),
+        ]);
+
+        let versions_to_mark =
+            build_versions_to_mark(&versions, &version_files).expect("should build versions");
+
+        assert_eq!(versions_to_mark.len(), 1);
+        assert_eq!(
+            versions_to_mark[0].collection_id,
+            delete_collection_id.to_string()
+        );
+        assert_eq!(versions_to_mark[0].versions, vec![3]);
+    }
+
+    #[test]
+    fn build_versions_to_mark_errors_on_missing_version_file() {
+        let collection_id = CollectionUuid::new();
+
+        let versions = HashMap::from([(
+            collection_id,
+            HashMap::from([(1, CollectionVersionAction::Delete)]),
+        )]);
+
+        let version_files = HashMap::new();
+
+        let err = build_versions_to_mark(&versions, &version_files)
+            .expect_err("should error on missing version file");
+        println!("build_versions_to_mark_errors_on_missing_version_file: {err:?}");
+        match err {
+            GarbageCollectorError::MissingVersionFile(id) => {
+                assert_eq!(id, collection_id);
+            }
+            other => panic!("expected MissingVersionFile, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_versions_to_mark_errors_on_missing_collection_info() {
+        let collection_id = CollectionUuid::new();
+
+        let versions = HashMap::from([(
+            collection_id,
+            HashMap::from([(1, CollectionVersionAction::Delete)]),
+        )]);
+
+        let version_files = HashMap::from([(
+            collection_id,
+            Arc::new(CollectionVersionFile {
+                collection_info_immutable: None,
+                ..Default::default()
+            }),
+        )]);
+
+        let err = build_versions_to_mark(&versions, &version_files)
+            .expect_err("should error on missing collection_info_immutable");
+        println!("build_versions_to_mark_errors_on_missing_collection_info: {err:?}");
+        match err {
+            GarbageCollectorError::InvariantViolation(msg) => {
+                assert!(
+                    msg.contains("Expected collection_info_immutable to be set"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected InvariantViolation, got: {other:?}"),
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn errors_on_empty_file_paths() {
@@ -1268,6 +1395,7 @@ mod tests {
         let logs = Log::InMemory(chroma_log::in_memory_log::InMemoryLog::default());
         let orchestrator = GarbageCollectorOrchestrator::new(
             root_collection_id,
+            database.clone(),
             root_collection.version_file_path.unwrap(),
             None,
             now,
@@ -1277,6 +1405,7 @@ mod tests {
             system.clone(),
             storage,
             logs,
+            None,
             root_manager,
             crate::types::CleanupMode::DeleteV2,
             1,
@@ -1288,5 +1417,392 @@ mod tests {
         assert!(result.is_err());
         println!("{:?}", result);
         assert!(format!("{:?}", result).contains("no file paths"));
+    }
+
+    fn test_version_file(
+        collection_id: CollectionUuid,
+        versions: Vec<CollectionVersionInfo>,
+    ) -> Arc<CollectionVersionFile> {
+        Arc::new(CollectionVersionFile {
+            collection_info_immutable: Some(CollectionInfoImmutable {
+                tenant_id: "test-tenant".to_string(),
+                database_id: "test-db".to_string(),
+                collection_id: collection_id.to_string(),
+                dimension: 0,
+                ..Default::default()
+            }),
+            version_history: Some(CollectionVersionHistory { versions }),
+        })
+    }
+
+    fn version_info(version: i64, has_paths: bool) -> CollectionVersionInfo {
+        CollectionVersionInfo {
+            version,
+            segment_info: Some(CollectionSegmentInfo {
+                segment_compaction_info: if has_paths {
+                    vec![FlushSegmentCompactionInfo {
+                        segment_id: "segment-1".to_string(),
+                        file_paths: HashMap::from([(
+                            "data".to_string(),
+                            FilePaths {
+                                paths: vec!["data/path".to_string()],
+                            },
+                        )]),
+                    }]
+                } else {
+                    vec![]
+                },
+            }),
+            collection_info_mutable: None,
+            created_at_secs: 0,
+            version_change_reason: 0,
+            version_file_name: String::new(),
+            marked_for_deletion: false,
+        }
+    }
+
+    fn test_orchestrator(
+        storage: chroma_storage::Storage,
+        collection_id: CollectionUuid,
+    ) -> GarbageCollectorOrchestrator {
+        let system = System::new();
+        let dispatcher = Dispatcher::new(Default::default());
+        let dispatcher_handle = system.start_component(dispatcher);
+        let root_manager = RootManager::new(storage.clone(), Box::new(NopCache));
+        let database_name = chroma_types::DatabaseName::new("test_db").expect("valid db name");
+
+        GarbageCollectorOrchestrator::new(
+            collection_id,
+            database_name,
+            "version_file".to_string(),
+            None,
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            chroma_sysdb::SysDb::Test(TestSysDb::new()),
+            dispatcher_handle,
+            system,
+            storage,
+            Log::InMemory(InMemoryLog::new()),
+            None,
+            root_manager,
+            crate::types::CleanupMode::DeleteV2,
+            1,
+            false,
+            false,
+            10,
+        )
+    }
+
+    fn fork_tree_graph(
+        root_collection_id: CollectionUuid,
+        root_versions: &[i64],
+        child_collection_id: CollectionUuid,
+        child_versions: &[i64],
+    ) -> VersionGraph {
+        let mut graph = VersionGraph::new();
+
+        let mut previous_root = None;
+        for version in root_versions {
+            let node = graph.add_node(VersionGraphNode {
+                collection_id: root_collection_id,
+                version: *version,
+                status: crate::types::VersionStatus::Deleted,
+            });
+            if let Some(previous) = previous_root {
+                graph.add_edge(previous, node, ());
+            }
+            previous_root = Some(node);
+        }
+
+        let root_tail = previous_root.expect("root_versions should not be empty");
+        let mut previous_child = None;
+        for version in child_versions {
+            let node = graph.add_node(VersionGraphNode {
+                collection_id: child_collection_id,
+                version: *version,
+                status: crate::types::VersionStatus::Deleted,
+            });
+            if let Some(previous) = previous_child {
+                graph.add_edge(previous, node, ());
+            } else {
+                graph.add_edge(root_tail, node, ());
+            }
+            previous_child = Some(node);
+        }
+
+        graph
+    }
+
+    fn file_path_set(paths: &[&str]) -> crate::types::FilePathSet {
+        let mut file_paths = crate::types::FilePathSet::new();
+        for path in paths {
+            file_paths.insert_path((*path).to_string());
+        }
+        file_paths
+    }
+
+    fn sorted_paths(file_paths: crate::types::FilePathSet) -> Vec<String> {
+        let mut paths = file_paths.iter().collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    #[tokio::test]
+    async fn allows_empty_file_paths_before_any_ancestor_has_paths_in_fork_tree() {
+        let (_storage_dir, storage) = test_storage();
+        let root_collection_id = CollectionUuid::new();
+        let child_collection_id = CollectionUuid::new();
+
+        let mut orchestrator = test_orchestrator(storage, child_collection_id);
+        orchestrator.version_files = HashMap::from([
+            (
+                root_collection_id,
+                test_version_file(
+                    root_collection_id,
+                    vec![version_info(0, false), version_info(1, false)],
+                ),
+            ),
+            (
+                child_collection_id,
+                test_version_file(
+                    child_collection_id,
+                    vec![version_info(0, false), version_info(1, false)],
+                ),
+            ),
+        ]);
+        orchestrator.versions_to_delete_output = Some(ComputeVersionsToDeleteOutput {
+            versions: HashMap::from([(
+                child_collection_id,
+                HashMap::from([(1, CollectionVersionAction::Keep)]),
+            )]),
+        });
+        orchestrator.graph = Some(fork_tree_graph(
+            root_collection_id,
+            &[0, 1],
+            child_collection_id,
+            &[0, 1],
+        ));
+
+        orchestrator
+            .handle_list_files_at_version_output(ListFilesAtVersionOutput {
+                collection_id: child_collection_id,
+                version: 1,
+                file_paths: crate::types::FilePathSet::new(),
+            })
+            .await
+            .expect("empty paths should be allowed until some ancestor first has paths");
+
+        assert!(orchestrator.file_ref_counts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn errors_on_cross_collection_missing_ancestor_versions_in_empty_path_invariant_check() {
+        let (_storage_dir, storage) = test_storage();
+        let root_collection_id = CollectionUuid::new();
+        let child_collection_id = CollectionUuid::new();
+
+        let mut orchestrator = test_orchestrator(storage, child_collection_id);
+        orchestrator.version_files = HashMap::from([
+            (
+                root_collection_id,
+                test_version_file(
+                    root_collection_id,
+                    vec![
+                        version_info(0, false),
+                        version_info(1, false),
+                        version_info(3, true),
+                    ],
+                ),
+            ),
+            (
+                child_collection_id,
+                test_version_file(
+                    child_collection_id,
+                    vec![
+                        version_info(0, false),
+                        version_info(1, false),
+                        version_info(2, false),
+                    ],
+                ),
+            ),
+        ]);
+        orchestrator.versions_to_delete_output = Some(ComputeVersionsToDeleteOutput {
+            versions: HashMap::from([(
+                child_collection_id,
+                HashMap::from([(2, CollectionVersionAction::Keep)]),
+            )]),
+        });
+        orchestrator.graph = Some(fork_tree_graph(
+            root_collection_id,
+            &[0, 1, 3],
+            child_collection_id,
+            &[0, 1, 2],
+        ));
+
+        let err = orchestrator
+            .handle_list_files_at_version_output(ListFilesAtVersionOutput {
+                collection_id: child_collection_id,
+                version: 2,
+                file_paths: crate::types::FilePathSet::new(),
+            })
+            .await
+            .expect_err("ancestor versions from another collection should resolve via that collection's version file");
+
+        match err {
+            GarbageCollectorError::InvariantViolation(message) => {
+                assert!(message.contains("has no file paths, but has ancestors with file paths"));
+            }
+            other => panic!("expected InvariantViolation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn errors_on_cross_collection_version_collisions_in_empty_path_invariant_check() {
+        let (_storage_dir, storage) = test_storage();
+        let root_collection_id = CollectionUuid::new();
+        let child_collection_id = CollectionUuid::new();
+
+        let mut orchestrator = test_orchestrator(storage, child_collection_id);
+
+        orchestrator.version_files = HashMap::from([
+            (
+                root_collection_id,
+                test_version_file(
+                    root_collection_id,
+                    vec![
+                        version_info(0, false),
+                        version_info(1, false),
+                        version_info(2, true),
+                    ],
+                ),
+            ),
+            (
+                child_collection_id,
+                test_version_file(
+                    child_collection_id,
+                    vec![
+                        version_info(0, false),
+                        version_info(1, false),
+                        version_info(2, false),
+                    ],
+                ),
+            ),
+        ]);
+        orchestrator.versions_to_delete_output = Some(ComputeVersionsToDeleteOutput {
+            versions: HashMap::from([(
+                child_collection_id,
+                HashMap::from([(2, CollectionVersionAction::Keep)]),
+            )]),
+        });
+        orchestrator.graph = Some(fork_tree_graph(
+            root_collection_id,
+            &[0, 1, 2],
+            child_collection_id,
+            &[0, 1, 2],
+        ));
+
+        let err = orchestrator
+            .handle_list_files_at_version_output(ListFilesAtVersionOutput {
+                collection_id: child_collection_id,
+                version: 2,
+                file_paths: crate::types::FilePathSet::new(),
+            })
+            .await
+            .expect_err("cross-collection version collisions should not bypass the invariant");
+
+        match err {
+            GarbageCollectorError::InvariantViolation(message) => {
+                assert!(message.contains("has no file paths, but has ancestors with file paths"));
+            }
+            other => panic!("expected invariant violation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_collection_empty_path_invariant_stops_before_unprotected_delete_candidates_can_proceed(
+    ) {
+        let (_storage_dir, storage) = test_storage();
+        let root_collection_id = CollectionUuid::new();
+        let child_collection_id = CollectionUuid::new();
+
+        let mut orchestrator = test_orchestrator(storage, child_collection_id);
+        orchestrator.version_files = HashMap::from([
+            (
+                root_collection_id,
+                test_version_file(
+                    root_collection_id,
+                    vec![
+                        version_info(0, false),
+                        version_info(1, false),
+                        version_info(2, true),
+                    ],
+                ),
+            ),
+            (
+                child_collection_id,
+                test_version_file(
+                    child_collection_id,
+                    vec![
+                        version_info(0, false),
+                        version_info(1, false),
+                        version_info(2, false),
+                    ],
+                ),
+            ),
+        ]);
+        orchestrator.versions_to_delete_output = Some(ComputeVersionsToDeleteOutput {
+            versions: HashMap::from([
+                (
+                    root_collection_id,
+                    HashMap::from([(2, CollectionVersionAction::Delete)]),
+                ),
+                (
+                    child_collection_id,
+                    HashMap::from([(2, CollectionVersionAction::Keep)]),
+                ),
+            ]),
+        });
+        orchestrator.graph = Some(fork_tree_graph(
+            root_collection_id,
+            &[0, 1, 2],
+            child_collection_id,
+            &[0, 1, 2],
+        ));
+
+        orchestrator
+            .handle_list_files_at_version_output(ListFilesAtVersionOutput {
+                collection_id: root_collection_id,
+                version: 2,
+                file_paths: file_path_set(&["data/path"]),
+            })
+            .await
+            .expect("delete candidates should be tracked for deleted ancestor versions");
+        assert_eq!(
+            sorted_paths(orchestrator.file_ref_counts.as_set(0)),
+            vec!["data/path".to_string()]
+        );
+
+        let err = orchestrator
+            .handle_list_files_at_version_output(ListFilesAtVersionOutput {
+                collection_id: child_collection_id,
+                version: 2,
+                file_paths: crate::types::FilePathSet::new(),
+            })
+            .await
+            .expect_err(
+                "kept child versions with empty paths must fail closed when ancestors have data",
+            );
+
+        match err {
+            GarbageCollectorError::InvariantViolation(message) => {
+                assert!(message.contains("has no file paths, but has ancestors with file paths"));
+            }
+            other => panic!("expected InvariantViolation, got {other:?}"),
+        }
+
+        assert_eq!(
+            sorted_paths(orchestrator.file_ref_counts.as_set(0)),
+            vec!["data/path".to_string()]
+        );
     }
 }

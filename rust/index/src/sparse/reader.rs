@@ -1,7 +1,4 @@
-use std::{
-    cmp::Ordering,
-    collections::{BinaryHeap, HashMap},
-};
+use std::collections::HashMap;
 
 use chroma_blockstore::BlockfileReader;
 use chroma_error::{ChromaError, ErrorCodes};
@@ -9,7 +6,7 @@ use chroma_types::SignedRoaringBitmap;
 use futures::future::join;
 use thiserror::Error;
 
-use crate::sparse::types::{encode_u32, DIMENSION_PREFIX};
+use crate::sparse::types::{encode_u32, Score, TopKHeap, DIMENSION_PREFIX};
 
 #[derive(Debug, Error)]
 pub enum SparseReaderError {
@@ -39,30 +36,6 @@ struct CursorBody<B, D> {
     dimension_upper_bound: f32,
     query: f32,
     value: f32,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct Score {
-    pub score: f32,
-    pub offset: u32,
-}
-
-impl Eq for Score {}
-
-// Reverse order by score for a min heap
-impl Ord for Score {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.score
-            .total_cmp(&other.score)
-            .then(self.offset.cmp(&other.offset))
-            .reverse()
-    }
-}
-
-impl PartialOrd for Score {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 #[derive(Clone)]
@@ -184,12 +157,10 @@ impl<'me> SparseReader<'me> {
             };
 
             let mut block_iterator = self.get_block_maxes(encoded_dimension_id).await?;
-            let Some((block_next_offset, block_max)) = block_iterator
+            let (block_next_offset, block_max) = block_iterator
                 .by_ref()
                 .find(|&(block_next_offset, _)| offset < block_next_offset)
-            else {
-                continue;
-            };
+                .unwrap_or((offset + 1, *dimension_max));
             let body = CursorBody {
                 block_iterator,
                 block_next_offset,
@@ -208,8 +179,8 @@ impl<'me> SparseReader<'me> {
         let Some(mut first_unchecked_offset) = heads.first().map(|head| head.offset) else {
             return Ok(Vec::new());
         };
-        let mut threshold = f32::MIN;
-        let mut top_scores = BinaryHeap::with_capacity(k as usize);
+        let mut top_scores = TopKHeap::new(k as usize);
+        let mut threshold = top_scores.threshold();
 
         loop {
             let mut accumulated_dimension_upper_bound = 0.0;
@@ -260,21 +231,7 @@ impl<'me> SparseReader<'me> {
                         body.query * body.value
                     })
                     .sum();
-                if (top_scores.len() as u32) < k {
-                    top_scores.push(Score { score, offset });
-                } else if top_scores
-                    .peek()
-                    .map(|score| score.score)
-                    .unwrap_or(f32::MIN)
-                    < score
-                {
-                    top_scores.pop();
-                    top_scores.push(Score { score, offset });
-                    threshold = top_scores
-                        .peek()
-                        .map(|score| score.score)
-                        .unwrap_or_default();
-                }
+                threshold = top_scores.push(score, offset);
                 first_unchecked_offset = pivot_offset + 1;
                 first_unchecked_offset
             } else {
@@ -299,16 +256,16 @@ impl<'me> SparseReader<'me> {
                 head.offset = offset;
 
                 if body.block_next_offset <= offset {
-                    let Some((block_next_offset, block_max)) = body
+                    let (block_next_offset, block_upper_bound) = body
                         .block_iterator
                         .by_ref()
                         .find(|&(block_next_offset, _)| offset < block_next_offset)
-                    else {
-                        heads.remove(head_index);
-                        continue;
-                    };
+                        .map(|(block_next_offset, block_max)| {
+                            (block_next_offset, body.query * block_max)
+                        })
+                        .unwrap_or((offset + 1, body.dimension_upper_bound));
                     body.block_next_offset = block_next_offset;
-                    body.block_upper_bound = body.query * block_max;
+                    body.block_upper_bound = block_upper_bound;
                 }
                 body.value = value;
 
@@ -327,36 +284,71 @@ mod tests {
     use super::*;
     use crate::sparse::writer::SparseWriter;
     use chroma_blockstore::{
-        arrow::provider::BlockfileReaderOptions, provider::BlockfileProvider,
+        arrow::provider::BlockfileReaderOptions, test_arrow_blockfile_provider,
         BlockfileWriterOptions,
     };
     use chroma_types::SignedRoaringBitmap;
 
-    async fn setup_reader_with_data(vectors: Vec<(u32, Vec<(u32, f32)>)>) -> SparseReader<'static> {
-        let provider = BlockfileProvider::new_memory();
+    /// Build a SparseReader from the given vectors.
+    /// When `strip_block_maxes` is true, the max blockfile is rebuilt with only
+    /// DIM entries (no block-max entries), simulating the broken index state
+    /// where the fresh max_writer lost block-max entries for non-delta dimensions.
+    async fn setup_reader(
+        vectors: Vec<(u32, Vec<(u32, f32)>)>,
+        strip_block_maxes: bool,
+    ) -> SparseReader<'static> {
+        // Leak TempDir so the directory lives for 'static (fine in tests).
+        let (temp_dir, provider) = test_arrow_blockfile_provider(8 * 1024 * 1024);
+        std::mem::forget(temp_dir);
 
         let max_writer = provider
-            .write::<u32, f32>(BlockfileWriterOptions::new("".to_string()))
+            .write::<u32, f32>(BlockfileWriterOptions::new("".to_string()).ordered_mutations())
             .await
             .unwrap();
         let offset_value_writer = provider
-            .write::<u32, f32>(BlockfileWriterOptions::new("".to_string()))
+            .write::<u32, f32>(BlockfileWriterOptions::new("".to_string()).ordered_mutations())
             .await
             .unwrap();
 
         let writer = SparseWriter::new(64, max_writer, offset_value_writer, None);
 
-        // Write all vectors
         for (offset, vector) in vectors {
             writer.set(offset, vector).await;
         }
 
         let flusher = Box::pin(writer.commit()).await.unwrap();
-        let max_id = flusher.max_id();
+        let mut max_id = flusher.max_id();
         let offset_value_id = flusher.offset_value_id();
         Box::pin(flusher.flush()).await.unwrap();
 
-        // Create and return reader
+        if strip_block_maxes {
+            // Read DIM entries from the original max blockfile
+            let orig_max = provider
+                .read::<u32, f32>(BlockfileReaderOptions::new(max_id, "".to_string()))
+                .await
+                .unwrap();
+            let dim_entries: Vec<(u32, f32)> = orig_max
+                .get_prefix(DIMENSION_PREFIX)
+                .await
+                .unwrap()
+                .collect();
+
+            // Create a new max blockfile with only DIM entries (no block maxes)
+            let stripped = provider
+                .write::<u32, f32>(BlockfileWriterOptions::new("".to_string()).ordered_mutations())
+                .await
+                .unwrap();
+            for (dim_id, value) in &dim_entries {
+                stripped
+                    .set(DIMENSION_PREFIX, *dim_id, *value)
+                    .await
+                    .unwrap();
+            }
+            let flusher = stripped.commit::<u32, f32>().await.unwrap();
+            max_id = flusher.id();
+            flusher.flush::<u32, f32>().await.unwrap();
+        }
+
         let max_reader = provider
             .read::<u32, f32>(BlockfileReaderOptions::new(max_id, "".to_string()))
             .await
@@ -380,7 +372,7 @@ mod tests {
             (4, vec![(4, 1.0), (5, 1.0)]),           // dot product with query: 0.0 (no overlap)
         ];
 
-        let reader = Box::pin(setup_reader_with_data(vectors)).await;
+        let reader = Box::pin(setup_reader(vectors, false)).await;
 
         // Test 1: Basic top-k query
         let query = vec![(0, 1.0), (1, 1.0)];
@@ -440,7 +432,7 @@ mod tests {
             vectors.push((i, dims));
         }
 
-        let reader = Box::pin(setup_reader_with_data(vectors)).await;
+        let reader = Box::pin(setup_reader(vectors, false)).await;
 
         // Query and verify we get top-k
         let query = vec![(0, 1.0), (1, 1.0), (2, 1.0)];
@@ -461,7 +453,7 @@ mod tests {
         // Test querying empty index
         // Note: We need to write at least one vector and then delete it to create valid blockfiles
         let vectors = vec![(0, vec![(0, 1.0)])]; // Add one vector
-        let reader = Box::pin(setup_reader_with_data(vectors)).await;
+        let reader = Box::pin(setup_reader(vectors, false)).await;
 
         // Now test with a query that won't match
         let query = vec![(99, 1.0)]; // Query for dimension that doesn't exist
@@ -482,7 +474,7 @@ mod tests {
             (2, vec![(0, 1.0)]),
         ];
 
-        let reader = Box::pin(setup_reader_with_data(vectors)).await;
+        let reader = Box::pin(setup_reader(vectors, false)).await;
 
         let query = vec![(0, 1.0)];
         let results = reader
@@ -507,7 +499,7 @@ mod tests {
             (4, vec![(2, 0.9), (4, 0.3), (5, 0.7)]),
         ];
 
-        let reader = Box::pin(setup_reader_with_data(vectors.clone())).await;
+        let reader = Box::pin(setup_reader(vectors.clone(), false)).await;
 
         let query = vec![(0, 0.4), (2, 0.6), (4, 0.5), (5, 0.3)];
 
@@ -536,6 +528,101 @@ mod tests {
         for i in 0..3 {
             assert_eq!(wand_results[i].offset, expected_scores[i].0);
             assert!((wand_results[i].score - expected_scores[i].1).abs() < 1e-6);
+        }
+    }
+
+    /// Test WAND without block maxes on a large dataset spanning multiple blocks.
+    /// Compares results from normal and stripped readers to ensure they match.
+    #[tokio::test]
+    async fn test_wand_without_block_maxes_large() {
+        let mut vectors = Vec::new();
+        for i in 0..1000u32 {
+            let dims: Vec<(u32, f32)> = ((i % 10)..(i % 10 + 5))
+                .map(|d| (d, (i as f32) * 0.001))
+                .collect();
+            vectors.push((i, dims));
+        }
+
+        let query = vec![(0, 1.0), (1, 1.0), (2, 1.0)];
+        let k = 10;
+
+        let normal = Box::pin(setup_reader(vectors.clone(), false)).await;
+        let stripped = Box::pin(setup_reader(vectors, true)).await;
+
+        let normal_results = normal
+            .wand(query.clone(), k, SignedRoaringBitmap::full())
+            .await
+            .unwrap();
+        let stripped_results = stripped
+            .wand(query, k, SignedRoaringBitmap::full())
+            .await
+            .unwrap();
+
+        assert_eq!(normal_results.len(), stripped_results.len());
+        for (n, s) in normal_results.iter().zip(stripped_results.iter()) {
+            assert_eq!(n.offset, s.offset, "offsets should match");
+            assert!(
+                (n.score - s.score).abs() < 1e-6,
+                "scores should match: {} vs {}",
+                n.score,
+                s.score
+            );
+        }
+    }
+
+    /// Test WAND without block maxes against manually computed scores.
+    /// Both normal and stripped readers must return exact top-k with correct scores.
+    #[tokio::test]
+    async fn test_wand_without_block_maxes_vs_exhaustive() {
+        let vectors = vec![
+            (0, vec![(0, 0.5), (2, 0.3), (5, 0.8)]),
+            (1, vec![(1, 0.7), (2, 0.2), (4, 0.9)]),
+            (2, vec![(0, 0.3), (3, 0.6), (5, 0.4)]),
+            (3, vec![(1, 0.8), (3, 0.5), (4, 0.2)]),
+            (4, vec![(2, 0.9), (4, 0.3), (5, 0.7)]),
+        ];
+
+        let query = vec![(0, 0.4), (2, 0.6), (4, 0.5), (5, 0.3)];
+
+        // Compute expected scores manually
+        let mut expected: Vec<(u32, f32)> = vectors
+            .iter()
+            .map(|(offset, vector)| {
+                let score: f32 = query
+                    .iter()
+                    .map(|(qd, qv)| {
+                        vector
+                            .iter()
+                            .find(|(vd, _)| vd == qd)
+                            .map(|(_, vv)| qv * vv)
+                            .unwrap_or(0.0)
+                    })
+                    .sum();
+                (*offset, score)
+            })
+            .collect();
+        expected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        for strip in [false, true] {
+            let reader = Box::pin(setup_reader(vectors.clone(), strip)).await;
+            let results = reader
+                .wand(query.clone(), 3, SignedRoaringBitmap::full())
+                .await
+                .unwrap();
+
+            assert_eq!(results.len(), 3, "strip={strip}");
+            for i in 0..3 {
+                assert_eq!(
+                    results[i].offset, expected[i].0,
+                    "strip={strip}: offset mismatch at rank {i}"
+                );
+                assert!(
+                    (results[i].score - expected[i].1).abs() < 1e-6,
+                    "strip={strip}: score mismatch at rank {i}: {} vs {}",
+                    results[i].score,
+                    expected[i].1
+                );
+            }
         }
     }
 }

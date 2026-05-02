@@ -24,9 +24,14 @@ use chroma_types::{
     UpdateMetadata, UpsertCollectionRecordsRequest, UpsertCollectionRecordsResponse, Where,
 };
 use reqwest::Method;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{client::ChromaHttpClientError, ChromaHttpClient};
+
+#[derive(Deserialize)]
+struct ForkCountResponse {
+    count: usize,
+}
 
 /// A handle to a specific collection within a Chroma database.
 ///
@@ -173,11 +178,13 @@ impl ChromaCollection {
     ///     All committed writes will be visible.
     ///   - [`ReadLevel::IndexOnly`] - Read only from the compacted index, skipping the WAL.
     ///     Faster, but recent writes that haven't been compacted may not be visible.
+    ///   - [`ReadLevel::IndexAndBoundedWal`] - Read from the index and up to a server-configured
+    ///     number of WAL entries for bounded query latency.
     ///
     /// # Example
     ///
     /// ```
-    /// use chroma_types::plan::ReadLevel;
+    /// use chroma::types::ReadLevel;
     ///
     /// # async fn example(collection: &chroma::ChromaCollection) -> Result<(), Box<dyn std::error::Error>> {
     /// // Skip WAL for faster count (may miss recent writes)
@@ -194,6 +201,7 @@ impl ChromaCollection {
             read_level: ReadLevel,
         }
         self.send_with_query::<(), CountQueryParams, u32>(
+            true,
             "count",
             "count",
             Method::GET,
@@ -225,6 +233,7 @@ impl ChromaCollection {
     /// ```
     pub async fn get_indexing_status(&self) -> Result<IndexStatusResponse, ChromaHttpClientError> {
         self.send::<(), IndexStatusResponse>(
+            true,
             "indexing_status",
             "indexing_status",
             Method::GET,
@@ -274,6 +283,7 @@ impl ChromaCollection {
     ) -> Result<(), ChromaHttpClientError> {
         // Returns empty map ({})
         self.send::<_, serde_json::Value>(
+            false,
             "modify",
             "",
             Method::PUT,
@@ -344,7 +354,8 @@ impl ChromaCollection {
             include.unwrap_or_else(IncludeList::default_get),
         )?;
         let request = request.into_payload()?;
-        self.send("get", "get", Method::POST, Some(request)).await
+        self.send(true, "get", "get", Method::POST, Some(request))
+            .await
     }
 
     /// Performs vector similarity search against the collection.
@@ -399,7 +410,7 @@ impl ChromaCollection {
             include.unwrap_or_else(IncludeList::default_query),
         )?;
         let request = request.into_payload()?;
-        self.send("query", "query", Method::POST, Some(request))
+        self.send(true, "query", "query", Method::POST, Some(request))
             .await
     }
 
@@ -567,11 +578,13 @@ impl ChromaCollection {
     ///     All committed writes will be visible.
     ///   - [`ReadLevel::IndexOnly`] - Read only from the compacted index, skipping the WAL.
     ///     Faster, but recent writes that haven't been compacted may not be visible.
+    ///   - [`ReadLevel::IndexAndBoundedWal`] - Read from the index and up to a server-configured
+    ///     number of WAL entries for bounded query latency.
     ///
     /// # Example
     ///
     /// ```
-    /// use chroma_types::plan::{SearchPayload, ReadLevel};
+    /// use chroma::types::{SearchPayload, ReadLevel};
     ///
     /// # async fn example(collection: &chroma::ChromaCollection) -> Result<(), Box<dyn std::error::Error>> {
     /// let search = SearchPayload::default().limit(Some(10), 0);
@@ -596,7 +609,7 @@ impl ChromaCollection {
             read_level,
         )?;
         let request = request.into_payload();
-        self.send("search", "search", Method::POST, Some(request))
+        self.send(true, "search", "search", Method::POST, Some(request))
             .await
     }
 
@@ -647,7 +660,8 @@ impl ChromaCollection {
             metadatas,
         )?;
         let request = request.into_payload();
-        self.send("add", "add", Method::POST, Some(request)).await
+        self.send(false, "add", "add", Method::POST, Some(request))
+            .await
     }
 
     /// Modifies existing records in the collection.
@@ -697,7 +711,7 @@ impl ChromaCollection {
             metadatas,
         )?;
         let request = request.into_payload();
-        self.send("update", "update", Method::POST, Some(request))
+        self.send(false, "update", "update", Method::POST, Some(request))
             .await
     }
 
@@ -748,7 +762,7 @@ impl ChromaCollection {
             metadatas,
         )?;
         let request = request.into_payload();
-        self.send("upsert", "upsert", Method::POST, Some(request))
+        self.send(false, "upsert", "upsert", Method::POST, Some(request))
             .await
     }
 
@@ -792,7 +806,7 @@ impl ChromaCollection {
             limit,
         )?;
         let request = request.into_payload()?;
-        self.send("delete", "delete", Method::POST, Some(request))
+        self.send(false, "delete", "delete", Method::POST, Some(request))
             .await
     }
 
@@ -828,7 +842,7 @@ impl ChromaCollection {
             new_name: new_name.into(),
         };
         let collection: Collection = self
-            .send("fork", "fork", Method::POST, Some(request))
+            .send(false, "fork", "fork", Method::POST, Some(request))
             .await?;
         Ok(ChromaCollection {
             client: self.client.clone(),
@@ -836,16 +850,45 @@ impl ChromaCollection {
         })
     }
 
+    /// Returns the number of forks that exist for this collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The collection no longer exists on the server
+    /// - Network communication fails
+    /// - The authenticated user lacks sufficient permissions
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use chroma::ChromaCollection;
+    /// # async fn example(collection: ChromaCollection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let count = collection.fork_count().await?;
+    /// println!("Collection has {} forks", count);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn fork_count(&self) -> Result<usize, ChromaHttpClientError> {
+        let response: ForkCountResponse = self
+            .send::<(), _>(true, "fork_count", "fork_count", Method::GET, None)
+            .await?;
+        Ok(response.count)
+    }
+
     /// Internal transport method that constructs collection-specific API paths and delegates to the client.
     async fn send<Body: Serialize, Response: DeserializeOwned>(
         &self,
+        read_only: bool,
         operation: &str,
         path: &str,
         method: Method,
         body: Option<Body>,
     ) -> Result<Response, ChromaHttpClientError> {
-        self.send_with_query::<Body, (), Response>(operation, path, method, body, None::<()>)
-            .await
+        self.send_with_query::<Body, (), Response>(
+            read_only, operation, path, method, body, None::<()>,
+        )
+        .await
     }
 
     /// Internal transport method with query parameter support.
@@ -855,6 +898,7 @@ impl ChromaCollection {
         Response: DeserializeOwned,
     >(
         &self,
+        read_only: bool,
         operation: &str,
         path: &str,
         method: Method,
@@ -868,9 +912,15 @@ impl ChromaCollection {
         );
         let path = path.trim_end_matches("/");
 
-        self.client
-            .send(&operation_name, method, path, body, query_params)
-            .await
+        if read_only {
+            self.client
+                .send_read_only(&operation_name, method, path, body, query_params)
+                .await
+        } else {
+            self.client
+                .send(&operation_name, method, path, body, query_params)
+                .await
+        }
     }
 }
 
@@ -1452,12 +1502,22 @@ mod tests {
             // IndexOnly may omit recent WAL writes; just ensure the call succeeds
             // and the response structure matches the requested payload.
             let index_only = collection
-                .search_with_options(vec![search], ReadLevel::IndexOnly)
+                .search_with_options(vec![search.clone()], ReadLevel::IndexOnly)
                 .await
                 .unwrap();
             assert_eq!(index_only.ids.len(), 1);
             assert!(index_only.documents[0].is_some());
             assert!(index_only.scores[0].is_some());
+
+            // IndexAndBoundedWal reads up to a server-configured number of WAL entries;
+            // just ensure the call succeeds and the response structure is valid.
+            let bounded = collection
+                .search_with_options(vec![search], ReadLevel::IndexAndBoundedWal)
+                .await
+                .unwrap();
+            assert_eq!(bounded.ids.len(), 1);
+            assert!(bounded.documents[0].is_some());
+            assert!(bounded.scores[0].is_some());
         })
         .await;
     }
@@ -1493,6 +1553,13 @@ mod tests {
             // INDEX_ONLY may omit recent WAL writes; just ensure the call succeeds
             let count = collection
                 .count_with_options(ReadLevel::IndexOnly)
+                .await
+                .unwrap();
+            assert!(count <= 3);
+
+            // INDEX_AND_BOUNDED_WAL reads up to a configured limit; just ensure the call succeeds
+            let count = collection
+                .count_with_options(ReadLevel::IndexAndBoundedWal)
                 .await
                 .unwrap();
             assert!(count <= 3);

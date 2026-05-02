@@ -1,11 +1,12 @@
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_types::{
     BatchGetCollectionSoftDeleteStatusError, BatchGetCollectionVersionFilePathsError, Collection,
-    CollectionAndSegments, CollectionUuid, CountForksError, Database, FlushCompactionResponse,
-    GetCollectionByCrnError, GetCollectionSizeError, GetCollectionWithSegmentsError,
-    GetCollectionsError, GetSegmentsError, ListAttachedFunctionsError, ListDatabasesError,
-    ListDatabasesResponse, Segment, SegmentFlushInfo, SegmentScope, SegmentType, SegmentUuid,
-    Tenant, UpdateTenantError, UpdateTenantResponse,
+    CollectionAndSegments, CollectionUuid, CountForksError, Database, DeleteCollectionError,
+    FlushCompactionResponse, GetCollectionByCrnError, GetCollectionSizeError,
+    GetCollectionWithSegmentsError, GetCollectionsError, GetSegmentsError,
+    ListAttachedFunctionsError, ListDatabasesError, ListDatabasesResponse, Segment,
+    SegmentFlushInfo, SegmentScope, SegmentType, SegmentUuid, Tenant, UpdateTenantError,
+    UpdateTenantResponse,
 };
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -61,6 +62,7 @@ struct Inner {
     #[derivative(Debug = "ignore")]
     storage: Option<chroma_storage::Storage>,
     mock_time: u64,
+    get_collections_error: bool,
 }
 
 impl TestSysDb {
@@ -77,6 +79,7 @@ impl TestSysDb {
                 tasks: HashMap::new(),
                 storage: None,
                 mock_time: 0,
+                get_collections_error: false,
             })),
         }
     }
@@ -84,6 +87,12 @@ impl TestSysDb {
     pub fn set_mock_time(&mut self, mock_time: u64) {
         let mut inner = self.inner.lock();
         inner.mock_time = mock_time;
+    }
+
+    /// When set, `get_collections` will return an error.
+    pub fn set_get_collections_error(&mut self, should_error: bool) {
+        let mut inner = self.inner.lock();
+        inner.get_collections_error = should_error;
     }
 
     pub fn add_collection(&mut self, collection: Collection) {
@@ -129,6 +138,21 @@ impl TestSysDb {
 
         let collection = inner.collections.get_mut(&collection_id).unwrap();
         collection.version_file_path = Some(version_file_path);
+    }
+
+    pub fn set_collection_updated_at(
+        &mut self,
+        collection_id: CollectionUuid,
+        updated_at: SystemTime,
+    ) {
+        let mut inner = self.inner.lock();
+        let collection = inner.collections.get_mut(&collection_id).unwrap();
+        collection.updated_at = updated_at;
+    }
+
+    pub fn soft_delete_collection(&mut self, collection_id: CollectionUuid) {
+        let mut inner = self.inner.lock();
+        inner.soft_deleted_collections.insert(collection_id);
     }
 
     fn filter_collections(
@@ -187,6 +211,15 @@ impl TestSysDb {
         &mut self,
         options: GetCollectionsOptions,
     ) -> Result<Vec<Collection>, GetCollectionsError> {
+        {
+            let inner = self.inner.lock();
+            if inner.get_collections_error {
+                return Err(GetCollectionsError::Internal(Box::new(
+                    McmrNotSupportedError("injected error".to_string()),
+                )));
+            }
+        }
+
         let GetCollectionsOptions {
             collection_id,
             collection_ids,
@@ -719,6 +752,24 @@ impl TestSysDb {
             }
         }
         Ok(statuses)
+    }
+
+    pub(crate) async fn finish_collection_deletion(
+        &mut self,
+        collection_id: CollectionUuid,
+    ) -> Result<(), DeleteCollectionError> {
+        let mut inner = self.inner.lock();
+        if !inner.soft_deleted_collections.remove(&collection_id) {
+            return Err(DeleteCollectionError::NotFound(collection_id.to_string()));
+        }
+        if inner.collections.remove(&collection_id).is_none() {
+            return Err(DeleteCollectionError::NotFound(collection_id.to_string()));
+        }
+        inner.collection_to_version_file.remove(&collection_id);
+        inner
+            .segments
+            .retain(|_, segment| segment.collection != collection_id);
+        Ok(())
     }
 
     pub(crate) async fn update_tenant(

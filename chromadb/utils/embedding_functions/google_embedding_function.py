@@ -7,7 +7,7 @@ from chromadb.utils.embedding_functions.schemas import validate_config_schema
 import warnings
 
 
-class GoogleGenaiEmbeddingFunction(EmbeddingFunction[Documents]):
+class GoogleGeminiEmbeddingFunction(EmbeddingFunction[Documents]):
     """To use this EmbeddingFunction, you must have the google-genai Python package installed and have a Gemini API key."""
 
     def __init__(
@@ -15,13 +15,13 @@ class GoogleGenaiEmbeddingFunction(EmbeddingFunction[Documents]):
         model_name: str = "gemini-embedding-001",
         task_type: Optional[str] = None,
         dimension: Optional[int] = None,
-        api_key_env_var: str = "GEMINI_API_KEY",
+        api_key_env_var: Optional[str] = "GEMINI_API_KEY",
         vertexai: Optional[bool] = None,
         project: Optional[str] = None,
         location: Optional[str] = None,
     ):
         """
-        Initialize the GoogleGenaiEmbeddingFunction.
+        Initialize the GoogleGeminiEmbeddingFunction.
 
         Args:
             model_name (str, optional): The name of the model to use for text embeddings.
@@ -35,6 +35,7 @@ class GoogleGenaiEmbeddingFunction(EmbeddingFunction[Documents]):
             api_key_env_var (str, optional): Environment variable name that contains your API key.
                 Defaults to "GEMINI_API_KEY".
             vertexai (bool, optional): Whether to use Vertex AI.
+                If enabled, an API key must not be provided, and the environment variable `GOOGLE_APPLICATION_CREDENTIALS` must be set to the path of your service account JSON file.
             project (str, optional): The Google Cloud project ID (required for Vertex AI).
             location (str, optional): The Google Cloud location/region (required for Vertex AI).
         """
@@ -52,10 +53,14 @@ class GoogleGenaiEmbeddingFunction(EmbeddingFunction[Documents]):
         self.vertexai = vertexai
         self.project = project
         self.location = location
-        self.api_key = os.getenv(self.api_key_env_var)
-        if not self.api_key:
+        self.api_key = os.getenv(self.api_key_env_var) if self.api_key_env_var else None
+        if self.api_key and self.vertexai:
             raise ValueError(
-                f"The {self.api_key_env_var} environment variable is not set."
+                "Vertex AI and API key are mutually exclusive in the client initializer."
+            )
+        if not self.api_key and not self.vertexai:
+            raise ValueError(
+                f"The {self.api_key_env_var} environment variable must be set if vertexai is not enabled."
             )
 
         self.client = genai.Client(
@@ -109,7 +114,7 @@ class GoogleGenaiEmbeddingFunction(EmbeddingFunction[Documents]):
 
     @staticmethod
     def name() -> str:
-        return "google_genai"
+        return "google_gemini"
 
     def default_space(self) -> Space:
         return "cosine"
@@ -130,7 +135,7 @@ class GoogleGenaiEmbeddingFunction(EmbeddingFunction[Documents]):
         if model_name is None:
             raise ValueError("The model name is required.")
 
-        return GoogleGenaiEmbeddingFunction(
+        return GoogleGeminiEmbeddingFunction(
             model_name=model_name,
             task_type=task_type,
             dimension=dimension,
@@ -189,7 +194,11 @@ class GoogleGenaiEmbeddingFunction(EmbeddingFunction[Documents]):
         Raises:
             ValidationError: If the configuration does not match the schema
         """
-        validate_config_schema(config, "google_genai")
+        validate_config_schema(config, "google_gemini")
+
+
+# Backward compatibility alias
+GoogleGenaiEmbeddingFunction = GoogleGeminiEmbeddingFunction
 
 
 class GoogleGenerativeAiEmbeddingFunction(EmbeddingFunction[Documents]):

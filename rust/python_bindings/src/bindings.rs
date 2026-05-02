@@ -18,11 +18,12 @@ use chroma_system::System;
 use chroma_types::{
     Collection, CollectionConfiguration, CollectionMetadataUpdate, CountCollectionsRequest,
     CountResponse, CreateCollectionRequest, CreateDatabaseRequest, CreateTenantRequest, Database,
-    DatabaseName, DeleteCollectionRequest, DeleteDatabaseRequest, GetCollectionRequest,
-    GetDatabaseRequest, GetResponse, GetTenantRequest, GetTenantResponse, HeartbeatError,
-    IncludeList, InternalCollectionConfiguration, InternalUpdateCollectionConfiguration, KnnIndex,
-    ListCollectionsRequest, ListDatabasesRequest, Metadata, QueryResponse,
-    UpdateCollectionConfiguration, UpdateCollectionRequest, UpdateMetadata, WrappedSerdeJsonError,
+    DatabaseName, DeleteCollectionRequest, DeleteDatabaseRequest, GetCollectionByIdRequest,
+    GetCollectionRequest, GetDatabaseRequest, GetResponse, GetTenantRequest, GetTenantResponse,
+    HeartbeatError, IncludeList, InternalCollectionConfiguration,
+    InternalUpdateCollectionConfiguration, KnnIndex, ListCollectionsRequest, ListDatabasesRequest,
+    Metadata, QueryResponse, UpdateCollectionConfiguration, UpdateCollectionRequest,
+    UpdateMetadata, WrappedSerdeJsonError,
 };
 use pyo3::{exceptions::PyValueError, pyclass, pyfunction, pymethods, types::PyAnyMethods, Python};
 use std::time::SystemTime;
@@ -52,14 +53,14 @@ impl PythonBindingsConfig {
 #[pyfunction]
 #[pyo3(signature = (py_args=None))]
 #[allow(dead_code)]
-pub fn cli(py_args: Option<Vec<String>>) -> ChromaPyResult<()> {
+pub fn cli(py: Python<'_>, py_args: Option<Vec<String>>) -> ChromaPyResult<()> {
     let args = py_args.unwrap_or_else(|| std::env::args().collect());
     let args = if args.is_empty() {
         vec!["chroma".to_string()]
     } else {
         args
     };
-    chroma_cli(args);
+    py.allow_threads(|| chroma_cli(args));
     Ok(())
 }
 
@@ -130,6 +131,8 @@ impl Bindings {
             enable_schema,
             min_records_for_invocation: default_min_records_for_invocation(),
             tenants_with_quantization_enabled: vec![],
+            tenants_with_maxscore_enabled: vec![],
+            enable_log_scouting: false,
         };
 
         let frontend = runtime.block_on(async {
@@ -343,6 +346,23 @@ impl Bindings {
         let collection = self
             .runtime
             .block_on(async { frontend.get_collection(request).await })?;
+        Ok(collection)
+    }
+
+    #[pyo3(signature = (collection_id, tenant = DEFAULT_TENANT.to_string(), database = DEFAULT_DATABASE.to_string()))]
+    fn get_collection_by_id(
+        &self,
+        collection_id: String,
+        tenant: String,
+        database: String,
+    ) -> ChromaPyResult<Collection> {
+        let database_name =
+            DatabaseName::new(database.clone()).ok_or(InvalidDatabaseNameError(database))?;
+        let request = GetCollectionByIdRequest::try_new(collection_id, tenant, database_name)?;
+        let mut frontend = self.frontend.clone();
+        let collection = self
+            .runtime
+            .block_on(async { frontend.get_collection_by_id(request).await })?;
         Ok(collection)
     }
 
@@ -581,7 +601,7 @@ impl Bindings {
         let mut frontend_clone = self.frontend.clone();
         let response = self
             .runtime
-            .block_on(async { Box::pin(frontend_clone.delete(request)).await })?;
+            .block_on(async { Box::pin(frontend_clone.delete(request, String::new())).await })?;
         Ok(response.deleted)
     }
 

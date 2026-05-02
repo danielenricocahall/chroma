@@ -27,11 +27,7 @@
             "group": "Overview",
             "pages": [
               "docs/overview/introduction",
-              "docs/overview/getting-started",
-              "docs/overview/architecture",
-              "docs/overview/oss",
-              "docs/overview/migration",
-              "docs/overview/troubleshooting"
+              "docs/overview/getting-started"
             ]
           },
           {
@@ -70,15 +66,38 @@
             "group": "CLI",
             "pages": [
               "docs/cli/install",
-              "docs/cli/browse",
-              "docs/cli/copy",
-              "docs/cli/db",
-              "docs/cli/sample-apps",
-              "docs/cli/login",
-              "docs/cli/profile",
               "docs/cli/run",
-              "docs/cli/update",
-              "docs/cli/vacuum"
+              {
+                "group": "Data Management",
+                "pages": [
+                  "docs/cli/browse",
+                  "docs/cli/copy",
+                  "docs/cli/db",
+                  "docs/cli/vacuum"
+                ]
+              },
+              {
+                "group": "Cloud",
+                "pages": [
+                  "docs/cli/login",
+                  "docs/cli/profile"
+                ]
+              },
+              {
+                "group": "Other",
+                "pages": [
+                  "docs/cli/sample-apps",
+                  "docs/cli/update"
+                ]
+              }
+            ]
+          },
+          {
+            "group": "Other",
+            "pages": [
+              "docs/overview/oss",
+              "docs/overview/migration",
+              "docs/overview/troubleshooting"
             ]
           }
         ]
@@ -126,7 +145,8 @@
               "cloud/sync/overview",
               "cloud/sync/s3",
               "cloud/sync/github",
-              "cloud/sync/web"
+              "cloud/sync/web",
+              "cloud/sync/file-upload"
             ]
           },
           {
@@ -158,12 +178,19 @@
             "pages": [
               "guides/deploy/client-server-mode",
               "guides/deploy/python-thin-client",
-              "guides/deploy/performance",
               "guides/deploy/observability",
               "guides/deploy/docker",
               "guides/deploy/aws",
               "guides/deploy/azure",
               "guides/deploy/gcp"
+            ]
+          },
+          {
+            "group": "Performance",
+            "pages": [
+              "guides/performance/general",
+              "guides/performance/single-node",
+              "guides/performance/distributed"
             ]
           }
         ]
@@ -197,7 +224,8 @@
               "integrations/embedding-models/cloudflare-workers-ai",
               "integrations/embedding-models/amazon-bedrock",
               "integrations/embedding-models/baseten",
-              "integrations/embedding-models/chroma-cloud-qwen"
+              "integrations/embedding-models/chroma-cloud-qwen",
+              "integrations/embedding-models/superlinked"
             ]
           },
           {
@@ -205,7 +233,8 @@
             "pages": [
               "integrations/embedding-models/chroma-bm25",
               "integrations/embedding-models/chroma-cloud-splade",
-              "integrations/embedding-models/hugging-face"
+              "integrations/embedding-models/hugging-face",
+              "integrations/embedding-models/superlinked"
             ]
           },
           {
@@ -392,6 +421,13 @@
               "reference/search",
               "reference/where-filter"
             ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "reference/architecture/overview",
+              "reference/architecture/distributed"
+            ]
           }
         ]
       }
@@ -416,7 +452,7 @@
     "links": [
       {
         "icon": "github",
-        "label": "26k",
+        "label": "27k",
         "href": "https://github.com/chroma-core/chroma"
       },
       {
@@ -425,7 +461,7 @@
         "href": "https://discord.gg/dSHcBEMSk7"
       },
       {
-        "label": "25k",
+        "label": "29k",
         "icon": "x-twitter",
         "href": "https://x.com/trychroma"
       }
@@ -489,6 +525,26 @@
       "destination": "/reference/overview"
     },
     {
+      "source": "/docs/overview/architecture",
+      "destination": "/reference/architecture/overview"
+    },
+    {
+      "source": "/reference/architecture",
+      "destination": "/reference/architecture/overview"
+    },
+    {
+      "source": "/references/architecture",
+      "destination": "/reference/architecture/overview"
+    },
+    {
+      "source": "/references/architecture/overview",
+      "destination": "/reference/architecture/overview"
+    },
+    {
+      "source": "/references/architecture/distributed",
+      "destination": "/reference/architecture/distributed"
+    },
+    {
       "source": "/reference/js/:slug*",
       "destination": "/reference/typescript/"
     },
@@ -507,6 +563,14 @@
     {
       "source": "/reference/typescript/index",
       "destination": "/reference/typescript/client"
+    },
+    {
+      "source": "/guides/deploy/performance",
+      "destination": "/guides/performance/single-node"
+    },
+    {
+      "source": "/guides/performance",
+      "destination": "/guides/performance/general"
     }
   ]
 }

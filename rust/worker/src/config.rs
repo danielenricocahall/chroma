@@ -1,6 +1,7 @@
 use chroma_config::assignment;
 use chroma_config::helpers::deserialize_duration_from_seconds;
 use chroma_index::config::SpannProviderConfig;
+use chroma_segment::bloom_filter::BloomFilterManagerConfig;
 use chroma_sysdb::SysDbConfig;
 use chroma_tracing::{OtelFilter, OtelFilterLevel};
 use figment::providers::{Env, Format, Yaml};
@@ -156,6 +157,13 @@ pub struct QueryServiceConfig {
     #[serde(default = "QueryServiceConfig::default_fetch_log_concurrency")]
     pub fetch_log_concurrency: usize,
 
+    /// The maximum number of WAL entries to read for the `IndexAndBoundedWal`
+    /// read level. Queries will read from the index plus up to this many
+    /// uncompacted log entries, providing a consistent prefix of the WAL with
+    /// bounded query latency.
+    #[serde(default = "QueryServiceConfig::default_bounded_wal_limit")]
+    pub bounded_wal_limit: u32,
+
     /// The configuration for managing SPANN indices within the query service.
     /// SPANN is a hierarchical inverted index that is used for approximate nearest neighbor search.
     #[serde(default)]
@@ -186,6 +194,11 @@ pub struct QueryServiceConfig {
     /// isolates fragment pull I/O from the rest of the query pipeline.
     #[serde(default)]
     pub fragment_storage: Option<chroma_storage::config::StorageConfig>,
+
+    /// The configuration for the bloom filter manager used by the record segment reader
+    /// for existence checks during queries.
+    #[serde(default)]
+    pub bloom_filter_manager: BloomFilterManagerConfig,
 
     /// The grace period for shutting down the gRPC server.
     #[serde(
@@ -222,6 +235,10 @@ impl QueryServiceConfig {
 
     fn default_fetch_log_concurrency() -> usize {
         10
+    }
+
+    fn default_bounded_wal_limit() -> u32 {
+        250
     }
 
     fn default_grpc_shutdown_grace_period() -> Duration {
@@ -318,6 +335,11 @@ pub struct CompactionServiceConfig {
     /// If set, a pprof server will be started on this port.
     #[serde(default)]
     pub jemalloc_pprof_server_port: Option<u16>,
+
+    /// The configuration for the bloom filter manager, which caches bloom filters
+    /// for existence checks during compaction.
+    #[serde(default)]
+    pub bloom_filter_manager: BloomFilterManagerConfig,
 
     /// The cache configuration for the fragment fetcher used by pointer-based log fetch.
     #[serde(default)]

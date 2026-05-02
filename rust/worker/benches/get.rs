@@ -28,6 +28,9 @@ fn trivial_get(
         trivial_filter(),
         trivial_limit(),
         trivial_projection(),
+        None,
+        0,
+        1,
     )
 }
 
@@ -46,6 +49,9 @@ fn get_false_filter(
         always_false_filter_for_modulo_metadata(),
         trivial_limit(),
         trivial_projection(),
+        None,
+        0,
+        1,
     )
 }
 
@@ -64,6 +70,9 @@ fn get_true_filter(
         always_true_filter_for_modulo_metadata(),
         trivial_limit(),
         trivial_projection(),
+        None,
+        0,
+        1,
     )
 }
 
@@ -82,6 +91,9 @@ fn get_true_filter_limit(
         always_true_filter_for_modulo_metadata(),
         offset_limit(),
         trivial_projection(),
+        None,
+        0,
+        1,
     )
 }
 
@@ -100,6 +112,9 @@ fn get_true_filter_limit_projection(
         always_true_filter_for_modulo_metadata(),
         offset_limit(),
         all_projection(),
+        None,
+        0,
+        1,
     )
 }
 

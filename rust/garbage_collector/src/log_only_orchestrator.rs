@@ -1,4 +1,5 @@
 use crate::garbage_collector_orchestrator_v2::GarbageCollectorError;
+use crate::mcmr::RegionsAndTopologies;
 use crate::operators::delete_unused_logs::{
     DeleteUnusedLogsError, DeleteUnusedLogsInput, DeleteUnusedLogsOperator, DeleteUnusedLogsOutput,
 };
@@ -10,8 +11,9 @@ use chroma_system::{
     wrap, ComponentContext, ComponentHandle, Dispatcher, Handler, Orchestrator,
     OrchestratorContext, TaskResult,
 };
-use chroma_types::CollectionUuid;
+use chroma_types::{CollectionUuid, DatabaseName};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::oneshot::Sender;
 use tracing::{Level, Span};
 
@@ -20,8 +22,10 @@ pub struct HardDeleteLogOnlyGarbageCollectorOrchestrator {
     context: OrchestratorContext,
     storage: Storage,
     logs: Log,
+    regions_and_topologies: Option<Arc<RegionsAndTopologies>>,
     result_channel: Option<Sender<Result<GarbageCollectorResponse, GarbageCollectorError>>>,
     collection_to_destroy: CollectionUuid,
+    database_name: Option<DatabaseName>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -30,14 +34,18 @@ impl HardDeleteLogOnlyGarbageCollectorOrchestrator {
         dispatcher: ComponentHandle<Dispatcher>,
         storage: Storage,
         logs: Log,
+        regions_and_topologies: Option<Arc<RegionsAndTopologies>>,
         collection_to_destroy: CollectionUuid,
+        database_name: Option<DatabaseName>,
     ) -> Self {
         Self {
             context: OrchestratorContext::new(dispatcher),
             storage,
             logs,
+            regions_and_topologies,
             result_channel: None,
             collection_to_destroy,
+            database_name,
         }
     }
 }
@@ -95,11 +103,13 @@ impl HardDeleteLogOnlyGarbageCollectorOrchestrator {
                 mode: CleanupMode::DeleteV2,
                 storage: self.storage.clone(),
                 logs: self.logs.clone(),
+                regions_and_topologies: self.regions_and_topologies.clone(),
                 enable_dangerous_option_to_ignore_min_versions_for_wal3: false,
             }),
             DeleteUnusedLogsInput {
                 collections_to_destroy,
                 collections_to_garbage_collect,
+                database_name: self.database_name.clone(),
             },
             ctx.receiver(),
             self.context.task_cancellation_token.clone(),
@@ -198,7 +208,9 @@ mod tests {
             dispatcher_handle.clone(),
             storage.clone(),
             logs.clone(),
+            None,
             collection_to_destroy,
+            None,
         );
 
         // Verify the orchestrator is properly initialized
@@ -240,7 +252,9 @@ mod tests {
             dispatcher_handle,
             storage.clone(),
             logs.clone(),
+            None,
             collection_to_destroy,
+            None,
         );
 
         // Verify the orchestrator stores correct collection UUID for destruction

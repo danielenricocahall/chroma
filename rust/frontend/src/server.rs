@@ -22,14 +22,15 @@ use chroma_types::{
     DatabaseName, DeleteCollectionRecordsPayload, DeleteCollectionRecordsResponse,
     DeleteCollectionResponse, DeleteDatabaseRequest, DeleteDatabaseResponse, DetachFunctionRequest,
     DetachFunctionResponse, ForkCollectionResponse, GetAttachedFunctionResponse,
-    GetCollectionByCrnRequest, GetCollectionRequest, GetDatabaseRequest, GetDatabaseResponse,
-    GetRequest, GetRequestPayload, GetResponse, GetTenantRequest, GetTenantResponse,
-    IndexStatusResponse, InternalCollectionConfiguration, InternalUpdateCollectionConfiguration,
-    ListCollectionsRequest, ListCollectionsResponse, ListDatabasesRequest, ListDatabasesResponse,
-    QueryRequest, QueryRequestPayload, QueryResponse, SearchRequest, SearchRequestPayload,
-    SearchResponse, UpdateCollectionPayload, UpdateCollectionRecordsPayload,
-    UpdateCollectionRecordsResponse, UpdateCollectionResponse, UpdateTenantRequest,
-    UpdateTenantResponse, UpsertCollectionRecordsPayload, UpsertCollectionRecordsResponse,
+    GetCollectionByCrnRequest, GetCollectionByIdRequest, GetCollectionRequest, GetDatabaseRequest,
+    GetDatabaseResponse, GetRequest, GetRequestPayload, GetResponse, GetTenantRequest,
+    GetTenantResponse, IndexStatusResponse, InternalCollectionConfiguration,
+    InternalUpdateCollectionConfiguration, ListCollectionsRequest, ListCollectionsResponse,
+    ListDatabasesRequest, ListDatabasesResponse, QueryRequest, QueryRequestPayload, QueryResponse,
+    SearchRequest, SearchRequestPayload, SearchResponse, UpdateCollectionPayload,
+    UpdateCollectionRecordsPayload, UpdateCollectionRecordsResponse, UpdateCollectionResponse,
+    UpdateTenantRequest, UpdateTenantResponse, UpsertCollectionRecordsPayload,
+    UpsertCollectionRecordsResponse,
 };
 use mdac::{Rule, Scorecard, ScorecardGuard};
 use opentelemetry::global;
@@ -73,17 +74,36 @@ impl chroma_error::ChromaError for RateLimitError {
     }
 }
 
+/// Response containing the fork count for a collection.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ForkCountResponse {
+    /// The number of forks for this collection.
+    pub count: usize,
+}
+
 async fn graceful_shutdown(system: System) {
     #[cfg(unix)]
     {
-        match signal(SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                sigterm.recv().await;
-                tracing::info!("Received SIGTERM, shutting down service");
-            }
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
             Err(err) => {
                 tracing::error!("Failed to create SIGTERM handler: {err}");
                 return;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::error!("Failed to create SIGINT handler: {err}");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, shutting down service");
+            }
+            _ = sigint.recv() => {
+                tracing::info!("Received SIGINT, shutting down service");
             }
         }
     }
@@ -125,9 +145,11 @@ pub struct Metrics {
     count_collections: Counter<u64>,
     get_collection: Counter<u64>,
     get_collection_by_crn: Counter<u64>,
+    get_collection_by_id: Counter<u64>,
     update_collection: Counter<u64>,
     delete_collection: Counter<u64>,
     fork_collection: Counter<u64>,
+    fork_count: Counter<u64>,
     collection_add: Counter<u64>,
     collection_update: Counter<u64>,
     collection_upsert: Counter<u64>,
@@ -163,9 +185,11 @@ impl Metrics {
             count_collections: meter.u64_counter("count_collections").build(),
             get_collection: meter.u64_counter("get_collection").build(),
             get_collection_by_crn: meter.u64_counter("get_collection_by_crn").build(),
+            get_collection_by_id: meter.u64_counter("get_collection_by_id").build(),
             update_collection: meter.u64_counter("update_collection").build(),
             delete_collection: meter.u64_counter("delete_collection").build(),
             fork_collection: meter.u64_counter("fork_collection").build(),
+            fork_count: meter.u64_counter("fork_count").build(),
             collection_add: meter.u64_counter("collection_add").build(),
             collection_update: meter.u64_counter("collection_update").build(),
             collection_upsert: meter.u64_counter("collection_upsert").build(),
@@ -180,6 +204,19 @@ impl Metrics {
             detach_function: meter.u64_counter("detach_function").build(),
         }
     }
+}
+
+fn reject_topology_database_operation(
+    database_name: &DatabaseName,
+    unsupported_feature: &str,
+) -> Result<(), ServerError> {
+    if database_name.topology().is_some() {
+        return Err(ValidationError::InvalidArgument(format!(
+            "multi-region databases do not support {unsupported_feature}"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -258,6 +295,10 @@ impl FrontendServer {
             .route("/api/v2/version", get(version))
             .route("/api/v2/auth/identity", get(get_user_identity))
             .route("/api/v2/collections/{crn}", get(get_collection_by_crn))
+            .route(
+                "/api/v2/tenants/{tenant}/databases/{database}/collections/by-id/{collection_id}",
+                get(get_collection_by_id),
+            )
             .route("/api/v2/tenants", post(create_tenant))
             .route("/api/v2/tenants/{tenant_name}", get(get_tenant))
             .route("/api/v2/tenants/{tenant_name}", patch(update_tenant))
@@ -286,6 +327,10 @@ impl FrontendServer {
             .route(
                 "/api/v2/tenants/{tenant}/databases/{database}/collections/{collection_id}/fork",
                 post(fork_collection),
+            )
+            .route(
+                "/api/v2/tenants/{tenant}/databases/{database}/collections/{collection_id}/fork_count",
+                get(fork_count),
             )
             .route(
                 "/api/v2/tenants/{tenant}/databases/{database}/collections/{collection_id}/add",
@@ -1455,6 +1500,77 @@ async fn get_collection_by_crn(
     Ok(Json(collection))
 }
 
+/// Get collection by ID
+/// Returns a collection by its UUID.
+#[utoipa::path(
+    get,
+    path = "/api/v2/tenants/{tenant}/databases/{database}/collections/by-id/{collection_id}",
+    summary = "Get collection by ID",
+    description = "Returns a collection by its UUID within a specific tenant and database.",
+    tag = "Collection",
+    security(
+        ("ApiKeyAuth" = [])
+    ),
+    responses(
+        (status = 200, description = "Collection found", body = Collection),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Collection not found", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    params(
+        ("tenant" = String, Path, description = "Tenant ID"),
+        ("database" = String, Path, description = "Database name"),
+        ("collection_id" = String, Path, description = "Collection UUID")
+    ),
+    extensions(
+        ("x-codeSamples" = json!([
+            {
+                "lang": "typescript",
+                "label": "Get collection by ID",
+                "source": "const collection = await client.getCollectionById({ id: 'collection-uuid-here' });"
+            },
+            {
+                "lang": "python",
+                "label": "Get collection by ID",
+                "source": "collection = client.get_collection_by_id(uuid.UUID('collection-uuid-here'))"
+            }
+        ]))
+    )
+)]
+async fn get_collection_by_id(
+    headers: HeaderMap,
+    Path((tenant, database, collection_id)): Path<(String, String, String)>,
+    State(mut server): State<FrontendServer>,
+) -> Result<Json<Collection>, ServerError> {
+    server.metrics.get_collection_by_id.add(1, &[]);
+    tracing::info!(name: "get_collection_by_id", tenant = %tenant, database = %database, collection_id = %collection_id);
+
+    // First authorize with the provided tenant/database
+    server
+        .authenticate_and_authorize(
+            &headers,
+            AuthzAction::GetCollection,
+            AuthzResource {
+                tenant: Some(tenant.clone()),
+                database: Some(database.clone()),
+                collection: Some(collection_id.clone()),
+            },
+        )
+        .await?;
+    let _guard =
+        server.scorecard_request(&["op:get_collection", format!("tenant:{}", tenant).as_str()])?;
+
+    let database_name = DatabaseName::new(&database).ok_or_else(|| {
+        ValidationError::InvalidArgument("database name must be at least 3 characters".to_string())
+    })?;
+
+    // Fetch collection by ID, scoped to tenant/database
+    let request = GetCollectionByIdRequest::try_new(collection_id, tenant, database_name)?;
+    let collection = server.frontend.get_collection_by_id(request).await?;
+
+    Ok(Json(collection))
+}
+
 /// Update collection
 /// Updates an existing collection's name or metadata.
 #[utoipa::path(
@@ -1705,12 +1821,7 @@ async fn fork_collection(
     let database_name = DatabaseName::new(&database).ok_or_else(|| {
         ValidationError::InvalidArgument("database name must be at least 3 characters".to_string())
     })?;
-    if database_name.topology().is_some() {
-        return Err(ValidationError::InvalidArgument(
-            "multi-region databases do not support forking".to_string(),
-        )
-        .into());
-    }
+    reject_topology_database_operation(&database_name, "forking")?;
     let _guard = server.scorecard_request(&[
         "op:fork_collection",
         format!("tenant:{}", tenant).as_str(),
@@ -1734,6 +1845,7 @@ async fn fork_collection(
             tenant.clone(),
             database.clone(),
             collection_id.0.to_string(),
+            server.config.region.clone(),
         ));
 
     let request = chroma_types::ForkCollectionRequest::try_new(
@@ -1750,6 +1862,79 @@ async fn fork_collection(
             .meter(metering_context_container)
             .await?,
     ))
+}
+
+/// Get fork count
+/// Returns the number of forks for a collection.
+#[utoipa::path(
+    get,
+    path = "/api/v2/tenants/{tenant}/databases/{database}/collections/{collection_id}/fork_count",
+    summary = "Get fork count",
+    description = "Returns the number of forks for a collection.",
+    tag = "Collection",
+    security(
+        ("ApiKeyAuth" = [])
+    ),
+    responses(
+        (status = 200, description = "Fork count retrieved successfully", body = ForkCountResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Collection not found", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    params(
+        ("tenant" = String, Path, description = "Tenant UUID", example = "1e30d217-3d78-4f8c-b244-79381dc6a254"),
+        ("database" = String, Path, description = "Database name"),
+        ("collection_id" = String, Path, description = "Collection UUID", example = "1e30d217-3d78-4f8c-b244-79381dc6a254")
+    ),
+    extensions(
+        ("x-codeSamples" = json!([
+            {
+                "lang": "typescript",
+                "label": "Get fork count",
+                "source": "const count = await collection.forkCount();"
+            },
+            {
+                "lang": "python",
+                "label": "Get fork count",
+                "source": "count = collection.fork_count()"
+            }
+        ]))
+    )
+)]
+async fn fork_count(
+    headers: HeaderMap,
+    Path((tenant, database, collection_id)): Path<(String, String, String)>,
+    State(mut server): State<FrontendServer>,
+) -> Result<Json<ForkCountResponse>, ServerError> {
+    server.metrics.fork_count.add(1, &[]);
+    tracing::info!(name: "fork_count", tenant_name = %tenant, database_name = %database, collection_id = %collection_id);
+    let database_name = DatabaseName::new(&database).ok_or_else(|| {
+        ValidationError::InvalidArgument("database name must be at least 3 characters".to_string())
+    })?;
+    let collection_uuid =
+        CollectionUuid::from_str(&collection_id).map_err(|_| ValidationError::CollectionId)?;
+    server
+        .authenticate_and_authorize_collection(
+            &headers,
+            AuthzAction::CountForks,
+            AuthzResource {
+                tenant: Some(tenant.clone()),
+                database: Some(database.clone()),
+                collection: Some(collection_id.clone()),
+            },
+            database_name,
+            collection_uuid,
+        )
+        .await?;
+    let _guard = server.scorecard_request(&[
+        "op:fork_count",
+        format!("tenant:{}", tenant).as_str(),
+        format!("collection:{}", collection_id).as_str(),
+    ])?;
+
+    let count = server.frontend.fork_count(collection_uuid).await?;
+
+    Ok(Json(ForkCountResponse { count }))
 }
 
 /// Add records
@@ -1856,6 +2041,7 @@ async fn collection_add(
             database.clone(),
             collection_id.0.to_string(),
             WriteAction::Add,
+            server.config.region.clone(),
         ));
 
     metering_context_container.enter();
@@ -1990,6 +2176,7 @@ async fn collection_update(
             database.clone(),
             collection_id.0.to_string(),
             WriteAction::Update,
+            server.config.region.clone(),
         ));
 
     metering_context_container.enter();
@@ -2124,6 +2311,7 @@ async fn collection_upsert(
             database.clone(),
             collection_id.0.to_string(),
             WriteAction::Upsert,
+            server.config.region.clone(),
         ));
 
     metering_context_container.enter();
@@ -2264,6 +2452,7 @@ async fn collection_delete(
             database.clone(),
             collection_id.0.to_string(),
             ReadAction::GetForDelete,
+            server.config.region.clone(),
         ));
 
     tracing::info!(name: "collection_delete", tenant_name = %tenant, database_name = %database, collection_id = %collection_id, num_ids = %payload.ids.as_ref().map_or(0, |ids| ids.len()), has_where = r#where.is_some());
@@ -2279,7 +2468,7 @@ async fn collection_delete(
     let response = Box::pin(
         server
             .frontend
-            .delete(request)
+            .delete(request, server.config.region.clone())
             .meter(metering_context_container),
     )
     .await?;
@@ -2380,6 +2569,7 @@ async fn collection_count(
             database.clone(),
             collection_id.clone(),
             ReadAction::Count,
+            server.config.region.clone(),
         ))
     } else {
         chroma_metering::create::<ExternalCollectionReadContext>(
@@ -2388,6 +2578,7 @@ async fn collection_count(
                 database.clone(),
                 collection_id.clone(),
                 ReadAction::Count,
+                server.config.region.clone(),
             ),
         )
     };
@@ -2493,6 +2684,7 @@ async fn indexing_status(
             database.clone(),
             collection_id.clone(),
             ReadAction::Query,
+            server.config.region.clone(),
         ));
 
     metering_context_container.enter();
@@ -2645,6 +2837,7 @@ async fn collection_get(
             database.clone(),
             collection_id.0.to_string(),
             ReadAction::Get,
+            server.config.region.clone(),
         ))
     } else {
         chroma_metering::create::<ExternalCollectionReadContext>(
@@ -2653,6 +2846,7 @@ async fn collection_get(
                 database.clone(),
                 collection_id.0.to_string(),
                 ReadAction::Get,
+                server.config.region.clone(),
             ),
         )
     };
@@ -2820,6 +3014,7 @@ async fn collection_query(
             database.clone(),
             collection_id.0.to_string(),
             ReadAction::Query,
+            server.config.region.clone(),
         ))
     } else {
         chroma_metering::create::<ExternalCollectionReadContext>(
@@ -2828,6 +3023,7 @@ async fn collection_query(
                 database.clone(),
                 collection_id.0.to_string(),
                 ReadAction::Query,
+                server.config.region.clone(),
             ),
         )
     };
@@ -2978,6 +3174,7 @@ async fn collection_search(
             database.clone(),
             collection_id.0.to_string(),
             ReadAction::Search,
+            server.config.region.clone(),
         ))
     } else {
         chroma_metering::create::<ExternalCollectionReadContext>(
@@ -2986,6 +3183,7 @@ async fn collection_search(
                 database.clone(),
                 collection_id.0.to_string(),
                 ReadAction::Search,
+                server.config.region.clone(),
             ),
         )
     };
@@ -3088,6 +3286,7 @@ async fn attach_function(
     let database_name = DatabaseName::new(database).ok_or_else(|| {
         ValidationError::InvalidArgument("database name must be at least 3 characters".to_string())
     })?;
+    reject_topology_database_operation(&database_name, "attached functions")?;
     let res = server
         .frontend
         .attach_function(tenant, database_name, collection_id, request)
@@ -3146,6 +3345,7 @@ async fn get_attached_function(
     let database_name = DatabaseName::new(database).ok_or_else(|| {
         ValidationError::InvalidArgument("database name must be at least 3 characters".to_string())
     })?;
+    reject_topology_database_operation(&database_name, "attached functions")?;
     let attached_function = server
         .frontend
         .get_attached_function(tenant, database_name, collection_id, function_name)
@@ -3209,6 +3409,7 @@ async fn detach_function(
     let database_name_typed = DatabaseName::new(database_name).ok_or_else(|| {
         ValidationError::InvalidArgument("database name must be at least 3 characters".to_string())
     })?;
+    reject_topology_database_operation(&database_name_typed, "attached functions")?;
     let res = server
         .frontend
         .detach_function(tenant, database_name_typed, collection_id, name, request)
@@ -3263,9 +3464,11 @@ impl Modify for ChromaTokenSecurityAddon {
         count_collections,
         get_collection,
         get_collection_by_crn,
+        get_collection_by_id,
         update_collection,
         delete_collection,
         fork_collection,
+        fork_count,
         collection_add,
         collection_update,
         collection_upsert,
@@ -3289,6 +3492,7 @@ mod tests {
     use crate::{config::FrontendServerConfig, Frontend, FrontendServer};
     use chroma_config::{registry::Registry, Configurable};
     use chroma_system::System;
+    use reqwest::{Client, Method, RequestBuilder, StatusCode};
     use std::sync::Arc;
 
     async fn test_server(mut config: FrontendServerConfig) -> u16 {
@@ -3320,6 +3524,31 @@ mod tests {
         ready_rx.await.unwrap()
     }
 
+    async fn assert_invalid_argument(request: RequestBuilder, expected_message_fragment: &str) {
+        let res = request.send().await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let response_json = res.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(
+            response_json["error"],
+            serde_json::Value::String("InvalidArgumentError".to_string()),
+        );
+        assert!(
+            response_json["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected_message_fragment),
+            "expected error message to contain {:?}, got: {:?}",
+            expected_message_fragment,
+            response_json["message"]
+        );
+    }
+
+    fn multi_region_database() -> &'static str {
+        "topology+multiregiondb"
+    }
+
     #[tokio::test]
     async fn test_cors() {
         let mut config = FrontendServerConfig::single_node_default();
@@ -3327,10 +3556,10 @@ mod tests {
 
         let port = test_server(config).await;
 
-        let client = reqwest::Client::new();
+        let client = Client::new();
         let res = client
             .request(
-                reqwest::Method::OPTIONS,
+                Method::OPTIONS,
                 format!("http://localhost:{}/api/v2/heartbeat", port),
             )
             .header("Origin", "http://localhost:8000")
@@ -3356,10 +3585,10 @@ mod tests {
 
         let port = test_server(config).await;
 
-        let client = reqwest::Client::new();
+        let client = Client::new();
         let res = client
             .request(
-                reqwest::Method::OPTIONS,
+                Method::OPTIONS,
                 format!("http://localhost:{}/api/v2/heartbeat", port),
             )
             .header("Origin", "http://localhost:8000")
@@ -3398,7 +3627,7 @@ mod tests {
         // By default, axum returns plaintext errors for some errors. This asserts that there's middleware to ensure all errors are returned as JSON.
         let port = test_server(FrontendServerConfig::single_node_default()).await;
 
-        let client = reqwest::Client::new();
+        let client = Client::new();
         let res = client
             .post(format!("http://localhost:{}/api/v2/tenants", port))
             .header("content-type", "application/json")
@@ -3423,42 +3652,97 @@ mod tests {
     async fn fork_collection_rejects_multi_region_database() {
         let port = test_server(FrontendServerConfig::single_node_default()).await;
 
-        let client = reqwest::Client::new();
+        let client = Client::new();
         let collection_id = uuid::Uuid::new_v4().to_string();
-        let res = client
-            .post(format!(
-                "http://localhost:{}/api/v2/tenants/test_tenant/databases/topology+multiregiondb/collections/{}/fork",
-                port, collection_id
-            ))
-            .header("content-type", "application/json")
-            .body(
-                serde_json::to_string(&serde_json::json!({
-                    "new_name": "forked_collection"
-                }))
-                .unwrap(),
-            )
-            .send()
-            .await
-            .unwrap();
+        assert_invalid_argument(
+            client
+                .post(format!(
+                    "http://localhost:{}/api/v2/tenants/test_tenant/databases/{}/collections/{}/fork",
+                    port,
+                    multi_region_database(),
+                    collection_id
+                ))
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::to_string(&serde_json::json!({
+                        "new_name": "forked_collection"
+                    }))
+                    .unwrap(),
+                ),
+            "multi-region databases do not support forking",
+        )
+        .await;
+    }
 
-        assert_eq!(
-            res.status(),
-            reqwest::StatusCode::BAD_REQUEST,
-            "multi-region database fork should be rejected"
-        );
-        let response_json = res.json::<serde_json::Value>().await.unwrap();
-        assert_eq!(
-            response_json["error"],
-            serde_json::Value::String("InvalidArgumentError".to_string()),
-        );
-        println!("response_json: {:?}", response_json);
-        assert!(
-            response_json["message"]
-                .as_str()
-                .unwrap()
-                .contains("multi-region databases do not support forking"),
-            "expected multi-region error message, got: {:?}",
-            response_json["message"]
-        );
+    #[tokio::test]
+    async fn attach_function_rejects_multi_region_database() {
+        let port = test_server(FrontendServerConfig::single_node_default()).await;
+
+        let client = Client::new();
+        let collection_id = uuid::Uuid::new_v4().to_string();
+        assert_invalid_argument(
+            client
+                .post(format!(
+                    "http://localhost:{}/api/v2/tenants/test_tenant/databases/{}/collections/{}/functions/attach",
+                    port,
+                    multi_region_database(),
+                    collection_id
+                ))
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::to_string(&serde_json::json!({
+                        "name": "my_function",
+                        "function_id": uuid::Uuid::new_v4().to_string(),
+                        "output_collection": "output_collection"
+                    }))
+                    .unwrap(),
+                ),
+            "multi-region databases do not support attached functions",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn get_attached_function_rejects_multi_region_database() {
+        let port = test_server(FrontendServerConfig::single_node_default()).await;
+
+        let client = Client::new();
+        let collection_id = uuid::Uuid::new_v4().to_string();
+        assert_invalid_argument(
+            client.get(format!(
+                "http://localhost:{}/api/v2/tenants/test_tenant/databases/{}/collections/{}/functions/my_function",
+                port,
+                multi_region_database(),
+                collection_id
+            )),
+            "multi-region databases do not support attached functions",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn detach_function_rejects_multi_region_database() {
+        let port = test_server(FrontendServerConfig::single_node_default()).await;
+
+        let client = Client::new();
+        let collection_id = uuid::Uuid::new_v4().to_string();
+        assert_invalid_argument(
+            client
+                .post(format!(
+                    "http://localhost:{}/api/v2/tenants/test_tenant/databases/{}/collections/{}/attached_functions/my_function/detach",
+                    port,
+                    multi_region_database(),
+                    collection_id
+                ))
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::to_string(&serde_json::json!({
+                        "delete_output": false
+                    }))
+                    .unwrap(),
+                ),
+            "multi-region databases do not support attached functions",
+        )
+        .await;
     }
 }

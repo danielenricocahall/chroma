@@ -164,7 +164,7 @@ type SpannIndexConfig struct {
 	EfSearch              *int     `json:"ef_search,omitempty"`
 	MaxNeighbors          *int     `json:"max_neighbors,omitempty"`
 	CenterDriftThreshold  *float64 `json:"center_drift_threshold,omitempty"`
-	Quantize              bool     `json:"quantize,omitempty"`
+	Quantize              string   `json:"quantize,omitempty"`
 }
 
 type VectorIndexType struct {
@@ -243,6 +243,7 @@ type SparseVectorIndexConfig struct {
 	EmbeddingFunction *EmbeddingFunctionConfiguration `json:"embedding_function,omitempty"`
 	SourceKey         *string                         `json:"source_key,omitempty"`
 	Bm25              *bool                           `json:"bm25,omitempty"`
+	Algorithm         *string                         `json:"algorithm,omitempty"`
 }
 
 type ValueTypes struct {

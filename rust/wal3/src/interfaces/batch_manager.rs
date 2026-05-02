@@ -276,11 +276,16 @@ impl<FP: FragmentPointer, U: FragmentUploader<FP>> FragmentPublisher for BatchMa
     }
 
     async fn read_json_file(&self, path: &str) -> Result<(Arc<Vec<u8>>, Option<ETag>), Error> {
-        Ok(
-            crate::interfaces::read_raw_bytes(path, self.fragment_uploader.storages().await)
-                .await
-                .map_err(Arc::new)?,
-        )
+        let preferred = self.fragment_uploader.preferred_storage_wrapper().await;
+        let path = crate::fragment_path(&preferred.prefix, path);
+        Ok(preferred
+            .storage
+            .get_with_e_tag(
+                &path,
+                chroma_storage::GetOptions::new(StorageRequestPriority::P0),
+            )
+            .await
+            .map_err(Arc::new)?)
     }
 
     async fn preferred_storage(&self) -> Storage {
@@ -343,7 +348,16 @@ impl<FP: FragmentPointer, U: FragmentUploader<FP>> FragmentPublisher for BatchMa
                 .await
             {
                 Ok(e_tag) => return Ok(e_tag),
+                Err(StorageError::AlreadyExists { path: _, source: _ }) => {
+                    return Err(Error::LogContentionFailure);
+                }
                 Err(StorageError::Precondition { path: _, source: _ }) => {
+                    return Err(Error::LogContentionFailure);
+                }
+                Err(StorageError::NotFound { path: _, source: _ }) => {
+                    // NotFound means another process deleted gc/GARBAGE between our
+                    // load (which obtained the ETag) and this conditional put.  Treat
+                    // it as contention so callers retry with a fresh load.
                     return Err(Error::LogContentionFailure);
                 }
                 Err(e) => {
@@ -365,8 +379,22 @@ impl<FP: FragmentPointer, U: FragmentUploader<FP>> FragmentPublisher for BatchMa
         e_tag: &ETag,
     ) -> Result<(), Error> {
         let empty = crate::Garbage::empty();
-        self.write_garbage(options, Some(e_tag), &empty).await?;
-        Ok(())
+        match self.write_garbage(options, Some(e_tag), &empty).await {
+            Ok(_) => Ok(()),
+            Err(Error::LogContentionFailure) => {
+                // The GARBAGE file was modified or deleted by another process between
+                // our load and this reset.  Either the file was deleted (nothing to
+                // reset) or overwritten with new content from a concurrent GC cycle
+                // (the new content will be processed in a future cycle).  Both cases
+                // are safe to treat as success.
+                tracing::info!("garbage reset skipped: file was concurrently modified or deleted");
+                Ok(())
+            }
+            Err(err) => {
+                tracing::error!(error =% err, "could not write garbage");
+                Err(err)
+            }
+        }
     }
 }
 
@@ -395,7 +423,7 @@ pub async fn upload_parquet(
         put_options = put_options.with_cmek(cmek);
     }
     loop {
-        tracing::info!("upload_parquet: {:?} with {} bytes", path, buffer.len());
+        tracing::info!(path = %path, bytes_uploaded = %buffer.len(), num_records = %messages.len(), "upload_parquet");
         // NOTE(rescrv):  This match block has been thoroughly reasoned through within the
         // `bootstrap` call above.  Don't change the error handling here without re-reasoning
         // there.
@@ -410,8 +438,12 @@ pub async fn upload_parquet(
             Err(err @ StorageError::PermissionDenied { .. }) => {
                 return Err(Error::StorageError(Arc::new(err)));
             }
-            Err(StorageError::Precondition { path: _, source: _ }) => {
-                return Err(Error::LogContentionFailure);
+            Err(StorageError::AlreadyExists { path: _, source: _ })
+            | Err(StorageError::Precondition { path: _, source: _ }) => {
+                // NOTE(rescrv):  It's gotta be a retry here because there was no write; the data
+                // is safe to retry; percolates as an error to the user otherwise when the requests
+                // are retryable.
+                return Err(Error::LogContentionRetry);
             }
             Err(err) => {
                 tracing::error!(
@@ -439,12 +471,52 @@ pub async fn upload_parquet(
 mod tests {
     use std::sync::Arc;
 
-    use chroma_storage::s3_client_for_test_with_new_bucket;
+    use chroma_storage::{s3_client_for_test_with_new_bucket, test_storage, PutOptions};
 
     use super::*;
     use crate::interfaces::s3::manifest_manager::ManifestManager;
     use crate::interfaces::s3::S3FragmentUploader;
-    use crate::{FragmentSeqNo, LogWriterOptions, SnapshotOptions, ThrottleOptions};
+    use crate::{
+        FragmentSeqNo, FragmentUuid, LogWriterOptions, SnapshotOptions, StorageWrapper,
+        ThrottleOptions,
+    };
+
+    #[tokio::test]
+    async fn test_k8s_integration_upload_parquet_returns_retry_on_already_exists() {
+        let storage = s3_client_for_test_with_new_bucket().await;
+        let prefix = "test-upload-parquet-retry";
+        let options = LogWriterOptions::default();
+        let fragment_identifier = FragmentIdentifier::SeqNo(FragmentSeqNo::from_u64(42));
+        let unprefixed_path = crate::unprefixed_fragment_path(fragment_identifier);
+        let path = format!("{prefix}/{unprefixed_path}");
+        // Pre-populate the path so that IfNotExist triggers AlreadyExists.
+        storage
+            .put_bytes(
+                &path,
+                b"pre-existing data".to_vec(),
+                chroma_storage::PutOptions::default(),
+            )
+            .await
+            .expect("pre-population should succeed");
+        let messages = vec![vec![1, 2, 3]];
+        let result = upload_parquet(
+            &options,
+            &storage,
+            prefix,
+            fragment_identifier,
+            Some(LogPosition::from_offset(1)),
+            messages,
+            None,
+            1_000_000,
+        )
+        .await;
+        let err = result.expect_err("upload_parquet should fail with LogContentionRetry");
+        println!("upload_parquet_returns_retry_on_already_exists: err={err:?}");
+        assert!(
+            matches!(err, Error::LogContentionRetry),
+            "expected LogContentionRetry, got {err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_k8s_integration_batches() {
@@ -509,5 +581,80 @@ mod tests {
         assert_eq!(vec![vec![1]], work[0].0);
         // Check batch 2
         assert_eq!(vec![vec![2, 3]], work[1].0);
+    }
+
+    struct DualStorageUploader {
+        preferred: usize,
+        storages: Arc<Vec<StorageWrapper>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FragmentUploader<FragmentUuid> for DualStorageUploader {
+        async fn upload_parquet(
+            &self,
+            _pointer: &FragmentUuid,
+            _messages: Vec<Vec<u8>>,
+            _cmek: Option<Cmek>,
+            _epoch_micros: u64,
+        ) -> Result<UploadResult, Error> {
+            unreachable!("upload_parquet is not used in this test")
+        }
+
+        async fn preferred_storage(&self) -> Storage {
+            self.storages[self.preferred].storage.clone()
+        }
+
+        async fn preferred_prefix(&self) -> String {
+            self.storages[self.preferred].prefix.clone()
+        }
+
+        async fn preferred_storage_wrapper(&self) -> &StorageWrapper {
+            &self.storages[self.preferred]
+        }
+
+        async fn storages(&self) -> &[StorageWrapper] {
+            &self.storages
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_json_file_uses_only_preferred_storage() {
+        let (_preferred_dir, preferred_storage) = test_storage();
+        let (_replica_dir, replica_storage) = test_storage();
+        let prefix = "test-read-json-file-preferred".to_string();
+        let path = format!("{prefix}/gc/GARBAGE");
+
+        replica_storage
+            .put_bytes(
+                &path,
+                br#"{"first_to_keep":1}"#.to_vec(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("write to replica storage");
+
+        let fragment_uploader = DualStorageUploader {
+            preferred: 0,
+            storages: Arc::new(vec![
+                StorageWrapper::new(
+                    "preferred".to_string(),
+                    preferred_storage.clone(),
+                    prefix.clone(),
+                ),
+                StorageWrapper::new("replica".to_string(), replica_storage, prefix),
+            ]),
+        };
+        let batch_manager = BatchManager::new(LogWriterOptions::default(), fragment_uploader)
+            .expect("batch manager");
+
+        let err = batch_manager
+            .read_json_file("gc/GARBAGE")
+            .await
+            .expect_err("preferred storage miss should not fall back to replicas");
+
+        assert!(
+            matches!(&err, Error::StorageError(storage_err) if matches!(&**storage_err, StorageError::NotFound { .. })),
+            "expected preferred-storage NotFound, got {err:?}"
+        );
     }
 }

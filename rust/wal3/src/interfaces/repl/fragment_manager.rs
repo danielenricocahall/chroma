@@ -10,7 +10,10 @@ use chroma_storage::{PutOptions, Storage, StorageError};
 use chroma_types::Cmek;
 
 use crate::interfaces::batch_manager::upload_parquet;
-use crate::interfaces::{FragmentConsumer, FragmentUploader, UploadResult};
+use crate::interfaces::{
+    fragment_upload_replica_fault_label, FragmentConsumer, FragmentUploadFault,
+    FragmentUploadFaultInjector, FragmentUploader, UploadResult,
+};
 use crate::{Error, Fragment, FragmentIdentifier, FragmentUuid, LogPosition, LogWriterOptions};
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -119,6 +122,7 @@ pub struct ReplicatedFragmentUploader {
     preferred: usize,
     storages: Arc<Vec<StorageWrapper>>,
     bookkeeping: Arc<Mutex<BookKeeping>>,
+    fault_injector: Option<Arc<dyn FragmentUploadFaultInjector>>,
 }
 
 impl ReplicatedFragmentUploader {
@@ -140,7 +144,16 @@ impl ReplicatedFragmentUploader {
             preferred,
             storages,
             bookkeeping,
+            fault_injector: None,
         }
+    }
+
+    pub fn with_fault_injector(
+        mut self,
+        fault_injector: Option<Arc<dyn FragmentUploadFaultInjector>>,
+    ) -> Self {
+        self.fault_injector = fault_injector;
+        self
     }
 
     fn compute_mask(&self) -> Result<Vec<bool>, Error> {
@@ -288,12 +301,44 @@ impl FragmentUploader<FragmentUuid> for ReplicatedFragmentUploader {
             if should_try {
                 let options = self.writer.clone();
                 let prefix = storage.prefix.clone();
+                let region = storage.region.clone();
                 let storage = storage.storage.clone();
                 let fragment_identifier = (*pointer).into();
                 let log_position = None;
                 let messages = messages.clone();
                 let cmek = cmek.clone();
+                let fault_injector = self.fault_injector.as_ref().map(Arc::clone);
                 futures.push(async move {
+                    if let Some(fault) = fault_injector
+                        .as_ref()
+                        .and_then(|fault_injector| fault_injector.fault_for_replica_upload(idx))
+                    {
+                        let fault_label = fragment_upload_replica_fault_label(idx)
+                            .unwrap_or("wal3.fragment_upload.<unknown>");
+                        match fault {
+                            FragmentUploadFault::Delay(delay) => {
+                                tracing::warn!(
+                                    fault_label,
+                                    replica_idx = idx,
+                                    region = %region,
+                                    delay_seconds = delay.as_secs_f64(),
+                                    "injecting wal3 replicated upload delay fault"
+                                );
+                                tokio::time::sleep(delay).await;
+                            }
+                            FragmentUploadFault::Unavailable => {
+                                tracing::warn!(
+                                    fault_label,
+                                    replica_idx = idx,
+                                    region = %region,
+                                    "injecting wal3 replicated upload unavailable fault"
+                                );
+                                return Err(Error::TonicError(tonic::Status::unavailable(
+                                    format!("fault injected for {fault_label}"),
+                                )));
+                            }
+                        }
+                    }
                     upload_parquet(
                         &options,
                         &storage,
@@ -409,6 +454,17 @@ impl FragmentReader {
         if !self.options.enable_read_repair || missing_storage_indices.is_empty() {
             return;
         }
+
+        let missing_regions = missing_storage_indices
+            .iter()
+            .map(|idx| self.storages[*idx].region.as_str())
+            .collect::<Vec<_>>();
+        tracing::warn!(
+            path,
+            missing_regions = ?missing_regions,
+            missing_replica_count = missing_regions.len(),
+            "read repair triggered"
+        );
 
         for idx in missing_storage_indices {
             // Try to acquire a permit without blocking. If unavailable, skip this repair.
@@ -1474,8 +1530,16 @@ mod tests {
         }
     }
 
+    fn make_storage_wrapper_with_region(
+        storage: chroma_storage::Storage,
+        prefix: &str,
+        region: &str,
+    ) -> StorageWrapper {
+        StorageWrapper::new(region.to_string(), storage, prefix.to_string())
+    }
+
     fn make_storage_wrapper(storage: chroma_storage::Storage, prefix: &str) -> StorageWrapper {
-        StorageWrapper::new("test-region".to_string(), storage, prefix.to_string())
+        make_storage_wrapper_with_region(storage, prefix, "test-region")
     }
 
     // Single replica successfully uploads.
@@ -1515,8 +1579,8 @@ mod tests {
     async fn test_k8s_mcmr_integration_replicated_uploader_two_replicas_both_succeed() {
         let storage1 = s3_client_for_test_with_new_bucket().await;
         let storage2 = s3_client_for_test_with_new_bucket().await;
-        let wrapper1 = make_storage_wrapper(storage1, "prefix1");
-        let wrapper2 = make_storage_wrapper(storage2, "prefix2");
+        let wrapper1 = make_storage_wrapper_with_region(storage1, "prefix1", "region-0");
+        let wrapper2 = make_storage_wrapper_with_region(storage2, "prefix2", "region-1");
         let storages = Arc::new(vec![wrapper1, wrapper2]);
         let uploader = ReplicatedFragmentUploader::new(
             make_test_options(2),
@@ -2107,10 +2171,24 @@ mod tests {
             "data should match what was uploaded"
         );
 
-        // Wait for the async read repair task to complete.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Poll until the async read repair task completes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if storage1
+                .get(&format!("prefix1/{}", test_path), GetOptions::default())
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "read repair should complete for storage1"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
-        // Verify storage1 now has the data from read repair.
+        // Verify storage1 now has the correct data from read repair.
         let repaired_data = storage1
             .get(&format!("prefix1/{}", test_path), GetOptions::default())
             .await
@@ -2337,15 +2415,15 @@ mod tests {
         // Immediately after read, permit may be in use by the spawned task.
         // We cannot reliably check this due to timing, so we skip this assertion.
 
-        // Wait for the repair task to complete.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // After repair completes, permit should be released.
-        assert_eq!(
-            semaphore.available_permits(),
-            1,
-            "permit should be released after repair completes"
-        );
+        // Poll until the repair task completes and releases the permit.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while semaphore.available_permits() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "permit should be released after repair completes"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         println!("read_repair_releases_semaphore_permit: passed");
     }
@@ -2389,10 +2467,28 @@ mod tests {
         assert!(result.is_ok(), "read_bytes should succeed via fallback");
         assert_eq!(result.unwrap().as_slice(), test_data);
 
-        // Wait for read repair tasks to complete.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Poll until both storage1 and storage2 have the repaired data.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let ok1 = storage1
+                .get(&format!("prefix1/{}", test_path), GetOptions::default())
+                .await
+                .is_ok();
+            let ok2 = storage2
+                .get(&format!("prefix2/{}", test_path), GetOptions::default())
+                .await
+                .is_ok();
+            if ok1 && ok2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "read repair should complete for both storage1 and storage2"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
-        // Verify both storage1 and storage2 now have the data.
+        // Verify the data is correct.
         let repaired_data1 = storage1
             .get(&format!("prefix1/{}", test_path), GetOptions::default())
             .await
@@ -2455,10 +2551,12 @@ mod tests {
         assert!(result.is_ok(), "read_bytes should succeed");
         assert_eq!(result.unwrap().as_slice(), test_data);
 
-        // Read should complete quickly (< 50ms) without waiting for repair.
-        // The repair task runs asynchronously after the read returns.
+        // Read should complete without waiting for repair.  The repair task runs asynchronously
+        // after the read returns.  Under heavy test parallelism the S3 GETs that make up the read
+        // can be slow, so we use a generous threshold that still catches the case where the read
+        // accidentally awaits the repair PUT.
         assert!(
-            read_duration < Duration::from_millis(50),
+            read_duration < Duration::from_secs(5),
             "read should complete quickly without waiting for repair, took {:?}",
             read_duration
         );
@@ -2526,10 +2624,28 @@ mod tests {
             handle.await.expect("task should not panic");
         }
 
-        // Wait for repair tasks to complete.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Poll until all files are repaired to storage1.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut all_repaired = true;
+            for i in 0..num_files {
+                let path = format!("prefix1/test-concurrent-{}.parquet", i);
+                if storage1.get(&path, GetOptions::default()).await.is_err() {
+                    all_repaired = false;
+                    break;
+                }
+            }
+            if all_repaired {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "all concurrent files should be repaired to storage1"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
-        // Verify all files were repaired to storage1.
+        // Verify all files have the correct data.
         for i in 0..num_files {
             let path = format!("prefix1/test-concurrent-{}.parquet", i);
             let expected_data = format!("data for file {}", i);
@@ -2614,8 +2730,15 @@ mod tests {
             handle.await.expect("task should not panic");
         }
 
-        // Wait for repairs to complete.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Poll until all in-flight repairs finish (semaphore fully released).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while shared_semaphore.available_permits() != 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "repair permits should be released"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         // The test verifies that with only 2 permits, some repairs may be skipped.
         // Count how many files were actually repaired.

@@ -260,6 +260,16 @@ export type ForkCollectionPayload = {
     new_name: string;
 };
 
+/**
+ * Response containing the fork count for a collection.
+ */
+export type ForkCountResponse = {
+    /**
+     * The number of forks for this collection.
+     */
+    count: number;
+};
+
 export type FtsIndexConfig = {
     [key: string]: never;
 };
@@ -468,7 +478,7 @@ export type RawWhereFields = {
     where_document?: unknown;
 };
 
-export type ReadLevel = 'index_and_wal' | 'index_only';
+export type ReadLevel = 'index_and_wal' | 'index_only' | 'index_and_bounded_wal';
 
 /**
  * Schema representation for collection index configurations
@@ -583,6 +593,14 @@ export type SpannIndexConfig = {
 };
 
 /**
+ * Sparse vector index algorithm.
+ *
+ * Controls which posting list format and query engine are used for
+ * sparse vector search within a collection.
+ */
+export type SparseIndexAlgorithm = 'wand' | 'max_score';
+
+/**
  * Represents a sparse vector using parallel arrays for indices and values.
  *
  * On deserialization: accepts both old format `{"indices": [...], "values": [...]}`
@@ -606,6 +624,13 @@ export type SparseVector = {
 };
 
 export type SparseVectorIndexConfig = {
+    /**
+     * Sparse index algorithm (cloud-only, tenant-gated).
+     * Omitted from JSON when set to the default (Wand) so that old
+     * servers/clients that do not know about this field can still
+     * deserialize the schema.
+     */
+    algorithm?: SparseIndexAlgorithm;
     /**
      * Whether this embedding is BM25
      */
@@ -1297,6 +1322,52 @@ export type CreateCollectionResponses = {
 
 export type CreateCollectionResponse = CreateCollectionResponses[keyof CreateCollectionResponses];
 
+export type GetCollectionByIdData = {
+    body?: never;
+    path: {
+        /**
+         * Tenant ID
+         */
+        tenant: string;
+        /**
+         * Database name
+         */
+        database: string;
+        /**
+         * Collection UUID
+         */
+        collection_id: string;
+    };
+    query?: never;
+    url: '/api/v2/tenants/{tenant}/databases/{database}/collections/by-id/{collection_id}';
+};
+
+export type GetCollectionByIdErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ErrorResponse;
+    /**
+     * Collection not found
+     */
+    404: ErrorResponse;
+    /**
+     * Server error
+     */
+    500: ErrorResponse;
+};
+
+export type GetCollectionByIdError = GetCollectionByIdErrors[keyof GetCollectionByIdErrors];
+
+export type GetCollectionByIdResponses = {
+    /**
+     * Collection found
+     */
+    200: Collection;
+};
+
+export type GetCollectionByIdResponse = GetCollectionByIdResponses[keyof GetCollectionByIdResponses];
+
 export type DeleteCollectionData = {
     body?: never;
     path: {
@@ -1662,6 +1733,52 @@ export type ForkCollectionResponses = {
 };
 
 export type ForkCollectionResponse = ForkCollectionResponses[keyof ForkCollectionResponses];
+
+export type ForkCountData = {
+    body?: never;
+    path: {
+        /**
+         * Tenant UUID
+         */
+        tenant: string;
+        /**
+         * Database name
+         */
+        database: string;
+        /**
+         * Collection UUID
+         */
+        collection_id: string;
+    };
+    query?: never;
+    url: '/api/v2/tenants/{tenant}/databases/{database}/collections/{collection_id}/fork_count';
+};
+
+export type ForkCountErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ErrorResponse;
+    /**
+     * Collection not found
+     */
+    404: ErrorResponse;
+    /**
+     * Server error
+     */
+    500: ErrorResponse;
+};
+
+export type ForkCountError = ForkCountErrors[keyof ForkCountErrors];
+
+export type ForkCountResponses = {
+    /**
+     * Fork count retrieved successfully
+     */
+    200: ForkCountResponse;
+};
+
+export type ForkCountResponse2 = ForkCountResponses[keyof ForkCountResponses];
 
 export type AttachFunctionData = {
     /**

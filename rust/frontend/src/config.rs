@@ -77,6 +77,10 @@ pub struct FrontendConfig {
     pub min_records_for_invocation: u64,
     #[serde(default = "Default::default")]
     pub tenants_with_quantization_enabled: Vec<String>,
+    #[serde(default = "Default::default")]
+    pub tenants_with_maxscore_enabled: Vec<String>,
+    #[serde(default = "default_enable_log_scouting")]
+    pub enable_log_scouting: bool,
 }
 
 impl FrontendConfig {
@@ -99,6 +103,8 @@ impl FrontendConfig {
             enable_schema: default_enable_schema(),
             min_records_for_invocation: default_min_records_for_invocation(),
             tenants_with_quantization_enabled: vec![],
+            tenants_with_maxscore_enabled: vec![],
+            enable_log_scouting: false,
         }
     }
 }
@@ -151,8 +157,16 @@ fn default_enable_schema() -> bool {
     true
 }
 
+fn default_enable_log_scouting() -> bool {
+    false
+}
+
 pub fn default_min_records_for_invocation() -> u64 {
     100
+}
+
+fn default_region() -> String {
+    String::new()
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -172,6 +186,8 @@ pub struct FrontendServerConfig {
     #[serde(default)]
     pub scorecard: Vec<ScorecardRule>,
     pub open_telemetry: Option<OpenTelemetryConfig>,
+    #[serde(default)]
+    pub stdout_tracing: bool,
     #[serde(default = "default_persist_path")]
     pub persist_path: String,
     #[serde(default = "default_sqlite_filename")]
@@ -180,6 +196,8 @@ pub struct FrontendServerConfig {
     pub cors_allow_origins: Option<Vec<String>>,
     #[serde(default = "default_enable_span_indexing")]
     pub enable_span_indexing: bool,
+    #[serde(default = "default_region")]
+    pub region: String,
 }
 
 const DEFAULT_CONFIG_PATH: &str = "sample_configs/distributed.yaml";

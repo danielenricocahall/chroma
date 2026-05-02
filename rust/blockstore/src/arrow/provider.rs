@@ -82,6 +82,7 @@ impl ArrowBlockfileProvider {
         block_cache: Box<dyn PersistentCache<Uuid, Block>>,
         root_cache: Box<dyn PersistentCache<Uuid, RootReader>>,
         num_concurrent_block_flushes: usize,
+        max_concurrent_block_loads: usize,
     ) -> Self {
         Self {
             block_manager: BlockManager::new(
@@ -89,9 +90,14 @@ impl ArrowBlockfileProvider {
                 max_block_size_bytes,
                 block_cache,
                 num_concurrent_block_flushes,
+                max_concurrent_block_loads,
             ),
             root_manager: RootManager::new(storage, root_cache),
         }
+    }
+
+    pub fn storage(&self) -> &Arc<Storage> {
+        self.block_manager.storage()
     }
 
     pub async fn read<
@@ -321,6 +327,9 @@ impl Configurable<(ArrowBlockfileProviderConfig, Storage)> for ArrowBlockfilePro
             blockfile_config
                 .block_manager_config
                 .num_concurrent_block_flushes,
+            blockfile_config
+                .block_manager_config
+                .max_concurrent_block_loads,
         ))
     }
 }
@@ -408,6 +417,7 @@ pub struct BlockManager {
     default_max_block_size_bytes: usize,
     block_metrics: BlockMetrics,
     num_concurrent_block_flushes: usize,
+    max_concurrent_block_loads: usize,
 }
 
 impl BlockManager {
@@ -416,6 +426,7 @@ impl BlockManager {
         default_max_block_size_bytes: usize,
         block_cache: Box<dyn PersistentCache<Uuid, Block>>,
         num_concurrent_block_flushes: usize,
+        max_concurrent_block_loads: usize,
     ) -> Self {
         let block_cache: Arc<dyn PersistentCache<Uuid, Block>> = block_cache.into();
         let storage = Arc::new(storage);
@@ -425,7 +436,12 @@ impl BlockManager {
             default_max_block_size_bytes,
             block_metrics: BlockMetrics::default(),
             num_concurrent_block_flushes,
+            max_concurrent_block_loads,
         }
+    }
+
+    pub fn storage(&self) -> &Arc<Storage> {
+        &self.storage
     }
 
     pub(super) fn create<K: ArrowWriteableKey, V: ArrowWriteableValue, D: Delta>(&self) -> D {
@@ -636,6 +652,16 @@ impl BlockManager {
 
     pub(super) fn num_concurrent_block_flushes(&self) -> usize {
         self.num_concurrent_block_flushes
+    }
+
+    /// Returns the concurrency limit for block loads.
+    /// A configured value of 0 means unbounded (returns `usize::MAX`).
+    /// Never returns 0 -- `buffer_unordered(0)` deadlocks.
+    pub(super) fn max_concurrent_block_loads(&self) -> usize {
+        match self.max_concurrent_block_loads {
+            0 => usize::MAX,
+            n => n,
+        }
     }
 
     /// Close the block manager, flushing any in-memory cache entries to disk in the PersistentCache.
@@ -896,6 +922,7 @@ mod tests {
             100,
             new_cache_for_test(),
             BlockManagerConfig::default_num_concurrent_block_flushes(),
+            BlockManagerConfig::default_max_concurrent_block_loads(),
         );
         assert!(!manager.block_cache.may_contain(&Uuid::new_v4()).await);
 
